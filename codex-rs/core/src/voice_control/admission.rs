@@ -7,6 +7,7 @@ use crate::voice_control::VoiceLease;
 use crate::voice_control::VoiceLeaseId;
 use crate::voice_control::VoiceLeaseState;
 use crate::voice_control::lease::VoiceLeaseTransitionError;
+use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::Duration;
 use std::time::Instant;
@@ -25,7 +26,6 @@ impl IdleEpoch {
 pub(crate) enum CommitmentState {
     Prepared,
     Committing,
-    Completed,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -59,22 +59,29 @@ enum AdmissionPermit {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct EffectBoundary {
-    pub(crate) commitment: CommitmentState,
+    operation_id: EffectOperationId,
+    lease_generation: LeaseGeneration,
 }
 
 impl EffectBoundary {
-    pub(crate) fn result_known(mut self) -> SubmissionResolution {
-        self.commitment = CommitmentState::Completed;
-        SubmissionResolution::KnownResult
+    pub(crate) fn commitment(&self) -> CommitmentState {
+        CommitmentState::Committing
     }
+}
 
-    /// Reports loss of the waiter after the effect boundary has been entered.
-    ///
-    /// This intentionally cannot become `Busy` or `NotSubmitted`; callers must not retry an
-    /// ambiguous, potentially committed human intention.
-    pub(crate) fn result_unknown(self) -> SubmissionResolution {
-        SubmissionResolution::UnknownResult
-    }
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct EffectOperationId(u64);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EffectOperationState {
+    Committing,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct EffectOperation {
+    lease_generation: LeaseGeneration,
+    state: EffectOperationState,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -112,7 +119,27 @@ pub(crate) enum BeginLeaseAcquireError {
     Busy,
     Stopping,
     FencingExhausted,
+    EffectInFlight,
+    RecoveryRequired,
     LeaseTransition(VoiceLeaseTransitionError),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum FinishLeaseCloseError {
+    ActiveTurn,
+    Stopping,
+    EffectInFlight,
+    RecoveryRequired,
+    FencingExhausted,
+    LeaseTransition(VoiceLeaseTransitionError),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ResolveEffectError {
+    UnknownOperation,
+    StaleGeneration,
+    AlreadyResolved,
+    FencingExhausted,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -127,6 +154,8 @@ struct AdmissionState {
     stopping: Option<StoppingFence>,
     stopping_generation: u64,
     fencing_exhausted: bool,
+    next_effect_operation_id: u64,
+    effect_operations: HashMap<EffectOperationId, EffectOperation>,
 }
 
 /// Core-owned admission foundation for voice-authorized human input.
@@ -149,6 +178,8 @@ impl Default for AdmissionController {
                 stopping: None,
                 stopping_generation: 0,
                 fencing_exhausted: false,
+                next_effect_operation_id: 0,
+                effect_operations: HashMap::new(),
             }),
         }
     }
@@ -172,6 +203,12 @@ impl AdmissionController {
         }
         if state.fencing_exhausted {
             return Err(BeginLeaseAcquireError::FencingExhausted);
+        }
+        if state.has_unknown_effect() {
+            return Err(BeginLeaseAcquireError::RecoveryRequired);
+        }
+        if !state.effect_operations.is_empty() {
+            return Err(BeginLeaseAcquireError::EffectInFlight);
         }
         state
             .lease
@@ -205,14 +242,32 @@ impl AdmissionController {
 
     pub(crate) fn finish_lease_close(
         &self,
-        _active_turn: &MutexGuard<'_, Option<ActiveTurn>>,
+        active_turn: &MutexGuard<'_, Option<ActiveTurn>>,
         lease_id: &VoiceLeaseId,
-    ) -> Result<(), VoiceLeaseTransitionError> {
-        self.authority
+    ) -> Result<(), FinishLeaseCloseError> {
+        if active_turn.is_some() {
+            return Err(FinishLeaseCloseError::ActiveTurn);
+        }
+        let mut state = self
+            .authority
             .lock()
-            .expect("voice authority mutex poisoned")
+            .expect("voice authority mutex poisoned");
+        if state.stopping.is_some() {
+            return Err(FinishLeaseCloseError::Stopping);
+        }
+        if state.fencing_exhausted {
+            return Err(FinishLeaseCloseError::FencingExhausted);
+        }
+        if state.has_unknown_effect() {
+            return Err(FinishLeaseCloseError::RecoveryRequired);
+        }
+        if !state.effect_operations.is_empty() {
+            return Err(FinishLeaseCloseError::EffectInFlight);
+        }
+        state
             .lease
             .finish_close(lease_id)
+            .map_err(FinishLeaseCloseError::LeaseTransition)
     }
 
     pub(crate) fn issue_ticket(
@@ -265,7 +320,7 @@ impl AdmissionController {
         if active_turn.is_some() {
             return Err(NotSubmittedReason::Busy);
         }
-        let state = self
+        let mut state = self
             .authority
             .lock()
             .expect("voice authority mutex poisoned");
@@ -287,10 +342,62 @@ impl AdmissionController {
         if ticket.idle_epoch != state.idle_epoch {
             return Err(NotSubmittedReason::StaleIdleEpoch);
         }
+        let Some(next_operation_id) = state.next_effect_operation_id.checked_add(1) else {
+            state.fencing_exhausted = true;
+            return Err(NotSubmittedReason::FencingExhausted);
+        };
+        state.next_effect_operation_id = next_operation_id;
+        let operation_id = EffectOperationId(next_operation_id);
+        state.effect_operations.insert(
+            operation_id,
+            EffectOperation {
+                lease_generation,
+                state: EffectOperationState::Committing,
+            },
+        );
         ticket.commitment = CommitmentState::Committing;
         Ok(EffectBoundary {
-            commitment: ticket.commitment,
+            operation_id,
+            lease_generation,
         })
+    }
+
+    /// Resolves delivery at the effect boundary; it does not imply terminal completion of a turn.
+    pub(crate) fn resolve_effect_known(
+        &self,
+        _active_turn: &MutexGuard<'_, Option<ActiveTurn>>,
+        boundary: &EffectBoundary,
+    ) -> Result<SubmissionResolution, ResolveEffectError> {
+        let mut state = self
+            .authority
+            .lock()
+            .expect("voice authority mutex poisoned");
+        state.resolve_effect(boundary)?;
+        state.effect_operations.remove(&boundary.operation_id);
+        Ok(SubmissionResolution::KnownResult)
+    }
+
+    /// Retains ambiguous delivery evidence and forces the lease into recovery-required state.
+    pub(crate) fn resolve_effect_unknown(
+        &self,
+        _active_turn: &MutexGuard<'_, Option<ActiveTurn>>,
+        boundary: &EffectBoundary,
+    ) -> Result<SubmissionResolution, ResolveEffectError> {
+        let mut state = self
+            .authority
+            .lock()
+            .expect("voice authority mutex poisoned");
+        state.resolve_effect(boundary)?;
+        let operation = state
+            .effect_operations
+            .get_mut(&boundary.operation_id)
+            .expect("effect operation disappeared while authority was locked");
+        operation.state = EffectOperationState::Unknown;
+        if state.lease.mark_recovery_required().is_err() {
+            state.fencing_exhausted = true;
+            return Err(ResolveEffectError::FencingExhausted);
+        }
+        Ok(SubmissionResolution::UnknownResult)
     }
 
     pub(crate) fn record_idle_transition(
@@ -362,6 +469,25 @@ impl AdmissionController {
 }
 
 impl AdmissionState {
+    fn has_unknown_effect(&self) -> bool {
+        self.effect_operations
+            .values()
+            .any(|operation| operation.state == EffectOperationState::Unknown)
+    }
+
+    fn resolve_effect(&self, boundary: &EffectBoundary) -> Result<(), ResolveEffectError> {
+        let Some(operation) = self.effect_operations.get(&boundary.operation_id) else {
+            return Err(ResolveEffectError::UnknownOperation);
+        };
+        if operation.state == EffectOperationState::Unknown {
+            return Err(ResolveEffectError::AlreadyResolved);
+        }
+        if operation.lease_generation != boundary.lease_generation {
+            return Err(ResolveEffectError::StaleGeneration);
+        }
+        Ok(())
+    }
+
     fn authorize(&self, request: &AdmissionRequest) -> Result<AdmissionPermit, NotSubmittedReason> {
         match (request.provenance.input_class(), request.authority) {
             (InputClass::CorrelatedResponse, SubmissionAuthority::CorrelatedResponse)
