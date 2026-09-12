@@ -17,8 +17,8 @@ impl LeaseGeneration {
         Self(0)
     }
 
-    fn next(self) -> Self {
-        Self(self.0.saturating_add(1))
+    fn next(self) -> Option<Self> {
+        self.0.checked_add(1).map(Self)
     }
 }
 
@@ -41,6 +41,7 @@ pub(crate) enum VoiceLeaseState {
 pub(crate) struct VoiceLease {
     state: VoiceLeaseState,
     generation: LeaseGeneration,
+    generation_exhausted: bool,
 }
 
 impl Default for VoiceLease {
@@ -48,6 +49,7 @@ impl Default for VoiceLease {
         Self {
             state: VoiceLeaseState::Free,
             generation: LeaseGeneration::initial(),
+            generation_exhausted: false,
         }
     }
 }
@@ -57,8 +59,12 @@ impl VoiceLease {
         &self.state
     }
 
-    pub(crate) fn generation(&self) -> LeaseGeneration {
-        self.generation
+    pub(crate) fn generation(&self) -> Result<LeaseGeneration, VoiceLeaseTransitionError> {
+        if self.generation_exhausted {
+            Err(VoiceLeaseTransitionError::GenerationExhausted)
+        } else {
+            Ok(self.generation)
+        }
     }
 
     pub(crate) fn begin_acquire(
@@ -68,7 +74,7 @@ impl VoiceLease {
         if self.state != VoiceLeaseState::Free {
             return Err(VoiceLeaseTransitionError::NotFree);
         }
-        self.generation = self.generation.next();
+        self.generation = self.next_generation(None)?;
         self.state = VoiceLeaseState::Acquiring { lease_id };
         Ok(self.generation)
     }
@@ -100,12 +106,12 @@ impl VoiceLease {
         lease_id: &VoiceLeaseId,
     ) -> Result<(), VoiceLeaseTransitionError> {
         self.require_owner(lease_id, LeasePhase::Closing)?;
-        self.generation = self.generation.next();
+        self.generation = self.next_generation(Some(lease_id.clone()))?;
         self.state = VoiceLeaseState::Free;
         Ok(())
     }
 
-    pub(crate) fn mark_recovery_required(&mut self) {
+    pub(crate) fn mark_recovery_required(&mut self) -> Result<(), VoiceLeaseTransitionError> {
         let lease_id = match &self.state {
             VoiceLeaseState::Free => None,
             VoiceLeaseState::Acquiring { lease_id }
@@ -113,8 +119,21 @@ impl VoiceLease {
             | VoiceLeaseState::Closing { lease_id } => Some(lease_id.clone()),
             VoiceLeaseState::RecoveryRequired { lease_id } => lease_id.clone(),
         };
-        self.generation = self.generation.next();
+        self.generation = self.next_generation(lease_id.clone())?;
         self.state = VoiceLeaseState::RecoveryRequired { lease_id };
+        Ok(())
+    }
+
+    fn next_generation(
+        &mut self,
+        lease_id: Option<VoiceLeaseId>,
+    ) -> Result<LeaseGeneration, VoiceLeaseTransitionError> {
+        let Some(generation) = self.generation.next() else {
+            self.generation_exhausted = true;
+            self.state = VoiceLeaseState::RecoveryRequired { lease_id };
+            return Err(VoiceLeaseTransitionError::GenerationExhausted);
+        };
+        Ok(generation)
     }
 
     fn require_owner(
@@ -148,7 +167,7 @@ enum LeasePhase {
     Closing,
 }
 
-#[derive(Debug, Error, Eq, PartialEq)]
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub(crate) enum VoiceLeaseTransitionError {
     #[error("voice lease is not free")]
     NotFree,
@@ -156,6 +175,8 @@ pub(crate) enum VoiceLeaseTransitionError {
     WrongState,
     #[error("voice lease is owned by another session")]
     WrongOwner,
+    #[error("voice lease generation exhausted")]
+    GenerationExhausted,
 }
 
 #[cfg(test)]

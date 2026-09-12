@@ -24,12 +24,13 @@ pub(crate) enum InputEffect {
 /// Authority assigned inside Core to the code path submitting an input.
 ///
 /// `AdministrativeRecovery` is deliberately distinct from voice and external-client authority. It
-/// is reserved for narrowly scoped future recovery operations and is never eligible for `Say` or
-/// `Steer`.
+/// is reserved for a narrowly scoped future recovery API and is never eligible for normal input
+/// admission.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SubmissionAuthority {
     ExternalClient,
     Voice,
+    CorrelatedResponse,
     InternalAgent,
     System,
     AdministrativeRecovery,

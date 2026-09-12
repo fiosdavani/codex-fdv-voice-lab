@@ -30,7 +30,7 @@ fn lease_follows_the_explicit_lifecycle() {
     lease.finish_close(&lease_id).expect("finish close");
 
     assert_eq!(lease.state(), &VoiceLeaseState::Free);
-    assert_ne!(lease.generation(), acquired_generation);
+    assert_ne!(lease.generation(), Ok(acquired_generation));
 }
 
 #[test]
@@ -40,13 +40,35 @@ fn uncertainty_fails_closed_instead_of_releasing_the_lease() {
     lease.begin_acquire(lease_id.clone()).expect("acquire");
     lease.activate(&lease_id).expect("activate");
 
-    lease.mark_recovery_required();
+    lease.mark_recovery_required().expect("mark recovery");
 
     assert_eq!(
         lease.state(),
         &VoiceLeaseState::RecoveryRequired {
             lease_id: Some(lease_id)
         }
+    );
+}
+
+#[test]
+fn generation_overflow_enters_recovery_and_fails_closed() {
+    let mut lease = VoiceLease {
+        state: VoiceLeaseState::Free,
+        generation: LeaseGeneration(u64::MAX),
+        generation_exhausted: false,
+    };
+
+    assert_eq!(
+        lease.begin_acquire(VoiceLeaseId::new("voice-session")),
+        Err(VoiceLeaseTransitionError::GenerationExhausted)
+    );
+    assert_eq!(
+        lease.state(),
+        &VoiceLeaseState::RecoveryRequired { lease_id: None }
+    );
+    assert_eq!(
+        lease.generation(),
+        Err(VoiceLeaseTransitionError::GenerationExhausted)
     );
 }
 

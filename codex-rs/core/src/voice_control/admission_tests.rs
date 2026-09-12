@@ -201,7 +201,9 @@ async fn stale_generation_and_idle_epoch_are_rejected() {
 
     let controller = AdmissionController::default();
     let epoch_ticket = issue(&controller, &guard, external(), now).expect("ticket");
-    controller.record_idle_transition(&guard);
+    controller
+        .record_idle_transition(&guard)
+        .expect("idle transition");
     assert_eq!(
         controller
             .enter_effect_boundary(&guard, epoch_ticket, now)
@@ -291,4 +293,149 @@ async fn stopping_fence_rejects_replacement_and_stale_finalizers() {
         .expect("successor fence");
     assert!(!controller.finish_stopping(&guard, "turn-a", generation));
     assert!(controller.finish_stopping(&guard, "turn-b", successor_generation));
+}
+
+#[tokio::test]
+async fn provenance_and_authority_must_match_explicitly() {
+    let active_turn = AsyncMutex::new(None);
+    let guard = active_turn.lock().await;
+    let controller = AdmissionController::default();
+    let now = Instant::now();
+    let cases = [
+        (
+            InputOrigin::InternalAgent,
+            SubmissionAuthority::InternalAgent,
+            true,
+        ),
+        (
+            InputOrigin::SystemContinuation,
+            SubmissionAuthority::System,
+            true,
+        ),
+        (
+            InputOrigin::CorrelatedResponse,
+            SubmissionAuthority::CorrelatedResponse,
+            true,
+        ),
+        (
+            InputOrigin::InternalAgent,
+            SubmissionAuthority::ExternalClient,
+            false,
+        ),
+        (
+            InputOrigin::SystemContinuation,
+            SubmissionAuthority::InternalAgent,
+            false,
+        ),
+        (
+            InputOrigin::CorrelatedResponse,
+            SubmissionAuthority::System,
+            false,
+        ),
+        (
+            InputOrigin::HumanExternalClient,
+            SubmissionAuthority::Unknown,
+            false,
+        ),
+        (
+            InputOrigin::Unknown,
+            SubmissionAuthority::ExternalClient,
+            false,
+        ),
+    ];
+
+    assert!(cases.into_iter().all(|(origin, authority, expected)| {
+        issue(
+            &controller,
+            &guard,
+            request(origin, InputEffect::Continue, authority, None),
+            now,
+        )
+        .is_ok()
+            == expected
+    }));
+}
+
+#[tokio::test]
+async fn lease_acquisition_requires_idle_without_a_stopping_fence() {
+    let active_turn = AsyncMutex::new(Some(ActiveTurn::default()));
+    let mut guard = active_turn.lock().await;
+    let controller = AdmissionController::default();
+
+    assert_eq!(
+        controller.begin_lease_acquire(&guard, VoiceLeaseId::new("busy")),
+        Err(BeginLeaseAcquireError::Busy)
+    );
+    *guard = None;
+    controller
+        .begin_stopping(&guard, "stopping-turn".to_string())
+        .expect("stopping fence");
+    assert_eq!(
+        controller.begin_lease_acquire(&guard, VoiceLeaseId::new("stopping")),
+        Err(BeginLeaseAcquireError::Stopping)
+    );
+
+    let controller = AdmissionController::default();
+    assert!(
+        controller
+            .begin_lease_acquire(&guard, VoiceLeaseId::new("idle"))
+            .is_ok()
+    );
+}
+
+#[tokio::test]
+async fn epoch_and_stopping_generation_overflow_fail_closed() {
+    let active_turn = AsyncMutex::new(None);
+    let guard = active_turn.lock().await;
+    let controller = AdmissionController::default();
+    controller
+        .authority
+        .lock()
+        .expect("voice authority mutex poisoned")
+        .idle_epoch = IdleEpoch(u64::MAX);
+    assert_eq!(
+        controller.record_idle_transition(&guard),
+        Err(FencingError::GenerationExhausted)
+    );
+    assert_eq!(
+        issue(
+            &controller,
+            &guard,
+            request(
+                InputOrigin::HumanExternalClient,
+                InputEffect::StartTurn,
+                SubmissionAuthority::ExternalClient,
+                None,
+            ),
+            Instant::now(),
+        )
+        .unwrap_err(),
+        NotSubmittedReason::FencingExhausted
+    );
+
+    let controller = AdmissionController::default();
+    controller
+        .authority
+        .lock()
+        .expect("voice authority mutex poisoned")
+        .stopping_generation = u64::MAX;
+    assert_eq!(
+        controller.begin_stopping(&guard, "turn".to_string()),
+        Err(BeginStoppingError::GenerationExhausted)
+    );
+    assert_eq!(
+        issue(
+            &controller,
+            &guard,
+            request(
+                InputOrigin::HumanExternalClient,
+                InputEffect::StartTurn,
+                SubmissionAuthority::ExternalClient,
+                None,
+            ),
+            Instant::now(),
+        )
+        .unwrap_err(),
+        NotSubmittedReason::FencingExhausted
+    );
 }
