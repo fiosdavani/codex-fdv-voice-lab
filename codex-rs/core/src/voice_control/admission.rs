@@ -1,6 +1,5 @@
 use crate::state::ActiveTurn;
-use crate::voice_control::InputEffect;
-use crate::voice_control::InputOrigin;
+use crate::voice_control::InputClass;
 use crate::voice_control::InputProvenance;
 use crate::voice_control::LeaseGeneration;
 use crate::voice_control::SubmissionAuthority;
@@ -9,6 +8,8 @@ use crate::voice_control::VoiceLeaseId;
 use crate::voice_control::VoiceLeaseState;
 use crate::voice_control::lease::VoiceLeaseTransitionError;
 use std::sync::Mutex;
+use std::time::Duration;
+use std::time::Instant;
 use tokio::sync::MutexGuard;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -22,8 +23,9 @@ impl IdleEpoch {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CommitmentState {
-    NotCommitted,
-    Committed,
+    Prepared,
+    Committing,
+    Completed,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -39,15 +41,12 @@ pub(crate) struct AdmissionTicket {
     idle_epoch: IdleEpoch,
     permit: AdmissionPermit,
     commitment: CommitmentState,
+    expires_at: Instant,
 }
 
 impl AdmissionTicket {
     pub(crate) fn commitment(&self) -> CommitmentState {
         self.commitment
-    }
-
-    pub(crate) fn expire(self) -> SubmissionResolution {
-        SubmissionResolution::NotSubmitted(NotSubmittedReason::TicketExpired)
     }
 }
 
@@ -59,12 +58,17 @@ enum AdmissionPermit {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct CommittedAdmission {
+pub(crate) struct EffectBoundary {
     pub(crate) commitment: CommitmentState,
 }
 
-impl CommittedAdmission {
-    /// Reports loss of the waiter after Core may have accepted the submission.
+impl EffectBoundary {
+    pub(crate) fn result_known(mut self) -> SubmissionResolution {
+        self.commitment = CommitmentState::Completed;
+        SubmissionResolution::KnownResult
+    }
+
+    /// Reports loss of the waiter after the effect boundary has been entered.
     ///
     /// This intentionally cannot become `Busy` or `NotSubmitted`; callers must not retry an
     /// ambiguous, potentially committed human intention.
@@ -76,6 +80,7 @@ impl CommittedAdmission {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SubmissionResolution {
     NotSubmitted(NotSubmittedReason),
+    KnownResult,
     UnknownResult,
 }
 
@@ -93,6 +98,11 @@ pub(crate) enum NotSubmittedReason {
 struct StoppingFence {
     turn_id: String,
     generation: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BeginStoppingError {
+    AlreadyStopping,
 }
 
 #[derive(Debug)]
@@ -180,6 +190,8 @@ impl AdmissionController {
         &self,
         active_turn: &MutexGuard<'_, Option<ActiveTurn>>,
         request: AdmissionRequest,
+        now: Instant,
+        ticket_ttl: Duration,
     ) -> Result<AdmissionTicket, NotSubmittedReason> {
         if active_turn.is_some() {
             return Err(NotSubmittedReason::Busy);
@@ -196,15 +208,24 @@ impl AdmissionController {
             lease_generation: state.lease.generation(),
             idle_epoch: state.idle_epoch,
             permit,
-            commitment: CommitmentState::NotCommitted,
+            commitment: CommitmentState::Prepared,
+            expires_at: now.checked_add(ticket_ttl).unwrap_or(now),
         })
     }
 
-    pub(crate) fn commit(
+    /// Revalidates a prepared ticket at the point where delivery may begin.
+    ///
+    /// P03 does not deliver the effect. Future ingress wiring must call this exactly at its real
+    /// effect boundary and then reuse the upstream start-if-idle primitive.
+    pub(crate) fn enter_effect_boundary(
         &self,
         active_turn: &MutexGuard<'_, Option<ActiveTurn>>,
         mut ticket: AdmissionTicket,
-    ) -> Result<CommittedAdmission, NotSubmittedReason> {
+        now: Instant,
+    ) -> Result<EffectBoundary, NotSubmittedReason> {
+        if now >= ticket.expires_at {
+            return Err(NotSubmittedReason::TicketExpired);
+        }
         if active_turn.is_some() {
             return Err(NotSubmittedReason::Busy);
         }
@@ -223,8 +244,8 @@ impl AdmissionController {
         if ticket.idle_epoch != state.idle_epoch {
             return Err(NotSubmittedReason::StaleIdleEpoch);
         }
-        ticket.commitment = CommitmentState::Committed;
-        Ok(CommittedAdmission {
+        ticket.commitment = CommitmentState::Committing;
+        Ok(EffectBoundary {
             commitment: ticket.commitment,
         })
     }
@@ -241,23 +262,26 @@ impl AdmissionController {
         &self,
         _active_turn: &MutexGuard<'_, Option<ActiveTurn>>,
         turn_id: String,
-    ) -> u64 {
+    ) -> Result<u64, BeginStoppingError> {
         let mut state = self
             .authority
             .lock()
             .expect("voice authority mutex poisoned");
+        if state.stopping.is_some() {
+            return Err(BeginStoppingError::AlreadyStopping);
+        }
         state.stopping_generation = state.stopping_generation.saturating_add(1);
         let generation = state.stopping_generation;
         state.stopping = Some(StoppingFence {
             turn_id,
             generation,
         });
-        generation
+        Ok(generation)
     }
 
     pub(crate) fn finish_stopping(
         &self,
-        _active_turn: &MutexGuard<'_, Option<ActiveTurn>>,
+        active_turn: &MutexGuard<'_, Option<ActiveTurn>>,
         turn_id: &str,
         generation: u64,
     ) -> bool {
@@ -265,10 +289,11 @@ impl AdmissionController {
             .authority
             .lock()
             .expect("voice authority mutex poisoned");
-        let matches_finalizer = state
-            .stopping
-            .as_ref()
-            .is_some_and(|fence| fence.turn_id == turn_id && fence.generation == generation);
+        let matches_finalizer = active_turn.is_none()
+            && state
+                .stopping
+                .as_ref()
+                .is_some_and(|fence| fence.turn_id == turn_id && fence.generation == generation);
         if matches_finalizer {
             state.stopping = None;
             state.idle_epoch = state.idle_epoch.next();
@@ -279,38 +304,39 @@ impl AdmissionController {
 
 impl AdmissionState {
     fn authorize(&self, request: &AdmissionRequest) -> Result<AdmissionPermit, NotSubmittedReason> {
-        if request.authority == SubmissionAuthority::AdministrativeRecovery
-            && matches!(
-                request.provenance.effect,
-                InputEffect::Say | InputEffect::Steer
-            )
-        {
+        if request.authority == SubmissionAuthority::AdministrativeRecovery {
             return Err(NotSubmittedReason::PermissionDenied);
         }
-        if !request.provenance.is_new_human_input() {
-            return Ok(AdmissionPermit::NonHumanInput);
-        }
-        match self.lease.state() {
-            VoiceLeaseState::Free
-                if request.authority != SubmissionAuthority::AdministrativeRecovery
-                    && request.provenance.origin != InputOrigin::HumanVoice =>
-            {
-                Ok(AdmissionPermit::UpstreamBaseline)
-            }
-            VoiceLeaseState::Free => Err(NotSubmittedReason::PermissionDenied),
-            VoiceLeaseState::Active { lease_id }
-                if request.provenance.origin == InputOrigin::HumanVoice
-                    && request.authority == SubmissionAuthority::Voice
-                    && request.voice_lease_id.as_ref() == Some(lease_id) =>
-            {
-                Ok(AdmissionPermit::Voice {
-                    lease_id: lease_id.clone(),
-                })
-            }
-            VoiceLeaseState::Acquiring { .. }
-            | VoiceLeaseState::Active { .. }
-            | VoiceLeaseState::Closing { .. }
-            | VoiceLeaseState::RecoveryRequired { .. } => Err(NotSubmittedReason::PermissionDenied),
+        match request.provenance.input_class() {
+            InputClass::CorrelatedResponse
+            | InputClass::InternalAgent
+            | InputClass::SystemContinuation => Ok(AdmissionPermit::NonHumanInput),
+            InputClass::ExternalHuman | InputClass::Unknown => match self.lease.state() {
+                VoiceLeaseState::Free => Ok(AdmissionPermit::UpstreamBaseline),
+                VoiceLeaseState::Acquiring { .. }
+                | VoiceLeaseState::Active { .. }
+                | VoiceLeaseState::Closing { .. }
+                | VoiceLeaseState::RecoveryRequired { .. } => {
+                    Err(NotSubmittedReason::PermissionDenied)
+                }
+            },
+            InputClass::VoiceHuman => match self.lease.state() {
+                VoiceLeaseState::Active { lease_id }
+                    if request.authority == SubmissionAuthority::Voice
+                        && request.voice_lease_id.as_ref() == Some(lease_id) =>
+                {
+                    Ok(AdmissionPermit::Voice {
+                        lease_id: lease_id.clone(),
+                    })
+                }
+                VoiceLeaseState::Free
+                | VoiceLeaseState::Acquiring { .. }
+                | VoiceLeaseState::Active { .. }
+                | VoiceLeaseState::Closing { .. }
+                | VoiceLeaseState::RecoveryRequired { .. } => {
+                    Err(NotSubmittedReason::PermissionDenied)
+                }
+            },
         }
     }
 

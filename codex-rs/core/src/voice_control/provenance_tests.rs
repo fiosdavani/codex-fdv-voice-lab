@@ -2,54 +2,61 @@ use super::*;
 use pretty_assertions::assert_eq;
 
 #[test]
-fn only_new_human_turns_are_subject_to_voice_lease_admission() {
+fn input_class_does_not_change_with_the_requested_effect() {
     let cases = [
         (
             InputProvenance {
                 origin: InputOrigin::HumanExternalClient,
                 effect: InputEffect::StartTurn,
             },
-            true,
+            InputClass::ExternalHuman,
         ),
         (
             InputProvenance {
-                origin: InputOrigin::Unknown,
-                effect: InputEffect::StartTurn,
+                origin: InputOrigin::HumanExternalClient,
+                effect: InputEffect::Steer,
             },
-            true,
+            InputClass::ExternalHuman,
+        ),
+        (
+            InputProvenance {
+                origin: InputOrigin::HumanVoice,
+                effect: InputEffect::Say,
+            },
+            InputClass::VoiceHuman,
         ),
         (
             InputProvenance {
                 origin: InputOrigin::CorrelatedResponse,
                 effect: InputEffect::Continue,
             },
-            false,
+            InputClass::CorrelatedResponse,
         ),
         (
             InputProvenance {
                 origin: InputOrigin::InternalAgent,
                 effect: InputEffect::StartTurn,
             },
-            false,
+            InputClass::InternalAgent,
         ),
         (
             InputProvenance {
                 origin: InputOrigin::SystemContinuation,
                 effect: InputEffect::Continue,
             },
-            false,
+            InputClass::SystemContinuation,
         ),
         (
             InputProvenance {
-                origin: InputOrigin::HumanVoice,
-                effect: InputEffect::Steer,
+                origin: InputOrigin::Unknown,
+                effect: InputEffect::Continue,
             },
-            false,
+            InputClass::Unknown,
         ),
     ];
 
     assert_eq!(
-        cases.map(|(provenance, _)| provenance.is_new_human_input()),
+        cases.map(|(provenance, _)| provenance.input_class()),
         cases.map(|(_, expected)| expected)
     );
 }

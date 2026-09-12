@@ -44,12 +44,27 @@ pub(crate) struct InputProvenance {
 }
 
 impl InputProvenance {
-    pub(crate) fn is_new_human_input(self) -> bool {
-        matches!(
-            self.origin,
-            InputOrigin::HumanExternalClient | InputOrigin::HumanVoice | InputOrigin::Unknown
-        ) && self.effect == InputEffect::StartTurn
+    pub(crate) fn input_class(self) -> InputClass {
+        match self.origin {
+            InputOrigin::HumanExternalClient => InputClass::ExternalHuman,
+            InputOrigin::HumanVoice => InputClass::VoiceHuman,
+            InputOrigin::CorrelatedResponse => InputClass::CorrelatedResponse,
+            InputOrigin::InternalAgent => InputClass::InternalAgent,
+            InputOrigin::SystemContinuation => InputClass::SystemContinuation,
+            InputOrigin::Unknown => InputClass::Unknown,
+        }
     }
+}
+
+/// Semantic class used by input admission independently of the requested effect.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum InputClass {
+    ExternalHuman,
+    VoiceHuman,
+    CorrelatedResponse,
+    InternalAgent,
+    SystemContinuation,
+    Unknown,
 }
 
 #[cfg(test)]

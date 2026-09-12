@@ -1,218 +1,294 @@
 use super::*;
+use crate::voice_control::InputEffect;
+use crate::voice_control::InputOrigin;
 use pretty_assertions::assert_eq;
+use std::time::Duration;
+use std::time::Instant;
 use tokio::sync::Mutex as AsyncMutex;
 
 fn request(
     origin: InputOrigin,
+    effect: InputEffect,
     authority: SubmissionAuthority,
     voice_lease_id: Option<VoiceLeaseId>,
 ) -> AdmissionRequest {
     AdmissionRequest {
-        provenance: InputProvenance {
-            origin,
-            effect: InputEffect::StartTurn,
-        },
+        provenance: InputProvenance { origin, effect },
         authority,
         voice_lease_id,
     }
 }
 
-#[tokio::test]
-async fn voice_disabled_preserves_upstream_admission_baseline() {
-    let active_turn = AsyncMutex::new(None);
-    let guard = active_turn.lock().await;
-    let controller = AdmissionController::default();
-
-    let ticket = controller
-        .issue_ticket(
-            &guard,
-            request(
-                InputOrigin::HumanExternalClient,
-                SubmissionAuthority::ExternalClient,
-                None,
-            ),
-        )
-        .expect("baseline ticket");
-
-    assert_eq!(ticket.commitment(), CommitmentState::NotCommitted);
-    assert_eq!(
-        controller.commit(&guard, ticket).expect("commit"),
-        CommittedAdmission {
-            commitment: CommitmentState::Committed
-        }
-    );
+fn issue(
+    controller: &AdmissionController,
+    guard: &MutexGuard<'_, Option<ActiveTurn>>,
+    request: AdmissionRequest,
+    now: Instant,
+) -> Result<AdmissionTicket, NotSubmittedReason> {
+    controller.issue_ticket(guard, request, now, Duration::from_secs(/* secs */ 10))
 }
 
 #[tokio::test]
-async fn active_lease_fails_closed_for_unknown_and_external_human_input() {
+async fn voice_disabled_preserves_external_upstream_baseline() {
     let active_turn = AsyncMutex::new(None);
     let guard = active_turn.lock().await;
     let controller = AdmissionController::default();
-    let lease_id = VoiceLeaseId::new("voice-session");
-    controller
-        .begin_lease_acquire(&guard, lease_id.clone())
-        .expect("acquire");
-    controller
-        .activate_lease(&guard, &lease_id)
-        .expect("activate");
-
-    let results = [
-        controller.issue_ticket(
-            &guard,
-            request(InputOrigin::Unknown, SubmissionAuthority::Unknown, None),
+    let now = Instant::now();
+    let ticket = issue(
+        &controller,
+        &guard,
+        request(
+            InputOrigin::HumanExternalClient,
+            InputEffect::StartTurn,
+            SubmissionAuthority::ExternalClient,
+            None,
         ),
-        controller.issue_ticket(
-            &guard,
-            request(
-                InputOrigin::HumanExternalClient,
-                SubmissionAuthority::ExternalClient,
-                None,
-            ),
+        now,
+    )
+    .expect("baseline ticket");
+
+    assert_eq!(ticket.commitment(), CommitmentState::Prepared);
+    let boundary = controller
+        .enter_effect_boundary(&guard, ticket, now)
+        .expect("effect boundary");
+    assert_eq!(boundary.commitment, CommitmentState::Committing);
+    assert_eq!(boundary.result_known(), SubmissionResolution::KnownResult);
+}
+
+#[tokio::test]
+async fn active_lease_governs_external_unknown_and_voice_effects() {
+    let active_turn = AsyncMutex::new(None);
+    let guard = active_turn.lock().await;
+    let controller = AdmissionController::default();
+    let owner = VoiceLeaseId::new("owner");
+    controller
+        .begin_lease_acquire(&guard, owner.clone())
+        .expect("acquire");
+    controller.activate_lease(&guard, &owner).expect("activate");
+    let now = Instant::now();
+    let denied = [
+        request(
+            InputOrigin::HumanExternalClient,
+            InputEffect::StartTurn,
+            SubmissionAuthority::ExternalClient,
+            None,
+        ),
+        request(
+            InputOrigin::HumanExternalClient,
+            InputEffect::Steer,
+            SubmissionAuthority::ExternalClient,
+            None,
+        ),
+        request(
+            InputOrigin::HumanVoice,
+            InputEffect::Say,
+            SubmissionAuthority::Voice,
+            Some(VoiceLeaseId::new("wrong")),
+        ),
+        request(
+            InputOrigin::Unknown,
+            InputEffect::StartTurn,
+            SubmissionAuthority::Unknown,
+            None,
+        ),
+        request(
+            InputOrigin::Unknown,
+            InputEffect::Continue,
+            SubmissionAuthority::Unknown,
+            None,
         ),
     ];
 
+    assert!(denied.into_iter().all(|request| {
+        issue(&controller, &guard, request, now).unwrap_err()
+            == NotSubmittedReason::PermissionDenied
+    }));
     assert!(
-        results
-            .into_iter()
-            .all(|result| result.unwrap_err() == NotSubmittedReason::PermissionDenied)
+        issue(
+            &controller,
+            &guard,
+            request(
+                InputOrigin::HumanVoice,
+                InputEffect::Say,
+                SubmissionAuthority::Voice,
+                Some(owner),
+            ),
+            now,
+        )
+        .is_ok()
     );
 }
 
 #[tokio::test]
-async fn administrative_recovery_cannot_submit_human_input() {
+async fn voice_input_without_a_lease_is_denied() {
     let active_turn = AsyncMutex::new(None);
     let guard = active_turn.lock().await;
     let controller = AdmissionController::default();
 
     assert_eq!(
-        controller
-            .issue_ticket(
-                &guard,
-                request(
-                    InputOrigin::HumanExternalClient,
-                    SubmissionAuthority::AdministrativeRecovery,
-                    None,
-                ),
-            )
-            .unwrap_err(),
+        issue(
+            &controller,
+            &guard,
+            request(
+                InputOrigin::HumanVoice,
+                InputEffect::Say,
+                SubmissionAuthority::Voice,
+                None,
+            ),
+            Instant::now(),
+        )
+        .unwrap_err(),
         NotSubmittedReason::PermissionDenied
     );
 }
 
 #[tokio::test]
-async fn changed_lease_generation_rejects_a_stale_ticket() {
+async fn administrative_recovery_never_receives_an_input_permit() {
     let active_turn = AsyncMutex::new(None);
     let guard = active_turn.lock().await;
     let controller = AdmissionController::default();
-    let ticket = controller
-        .issue_ticket(
+    let now = Instant::now();
+    let attempts = [
+        (InputOrigin::HumanExternalClient, InputEffect::StartTurn),
+        (InputOrigin::HumanVoice, InputEffect::Say),
+        (InputOrigin::HumanExternalClient, InputEffect::Steer),
+        (InputOrigin::Unknown, InputEffect::Continue),
+        (InputOrigin::InternalAgent, InputEffect::Continue),
+        (InputOrigin::CorrelatedResponse, InputEffect::Continue),
+    ];
+
+    assert!(attempts.into_iter().all(|(origin, effect)| {
+        issue(
+            &controller,
             &guard,
             request(
-                InputOrigin::HumanExternalClient,
-                SubmissionAuthority::ExternalClient,
+                origin,
+                effect,
+                SubmissionAuthority::AdministrativeRecovery,
                 None,
             ),
+            now,
         )
-        .expect("ticket");
-    let lease_id = VoiceLeaseId::new("voice-session");
-    controller
-        .begin_lease_acquire(&guard, lease_id)
-        .expect("acquire");
-
-    assert_eq!(
-        controller.commit(&guard, ticket).unwrap_err(),
-        NotSubmittedReason::StaleGeneration
-    );
+        .unwrap_err()
+            == NotSubmittedReason::PermissionDenied
+    }));
 }
 
 #[tokio::test]
-async fn changed_idle_epoch_rejects_a_stale_ticket() {
+async fn stale_generation_and_idle_epoch_are_rejected() {
     let active_turn = AsyncMutex::new(None);
     let guard = active_turn.lock().await;
     let controller = AdmissionController::default();
-    let ticket = controller
-        .issue_ticket(
-            &guard,
-            request(
-                InputOrigin::HumanExternalClient,
-                SubmissionAuthority::ExternalClient,
-                None,
-            ),
+    let now = Instant::now();
+    let external = || {
+        request(
+            InputOrigin::HumanExternalClient,
+            InputEffect::StartTurn,
+            SubmissionAuthority::ExternalClient,
+            None,
         )
-        .expect("ticket");
-    controller.record_idle_transition(&guard);
-
+    };
+    let generation_ticket = issue(&controller, &guard, external(), now).expect("ticket");
+    controller
+        .begin_lease_acquire(&guard, VoiceLeaseId::new("voice-session"))
+        .expect("acquire");
     assert_eq!(
-        controller.commit(&guard, ticket).unwrap_err(),
+        controller
+            .enter_effect_boundary(&guard, generation_ticket, now)
+            .unwrap_err(),
+        NotSubmittedReason::StaleGeneration
+    );
+
+    let controller = AdmissionController::default();
+    let epoch_ticket = issue(&controller, &guard, external(), now).expect("ticket");
+    controller.record_idle_transition(&guard);
+    assert_eq!(
+        controller
+            .enter_effect_boundary(&guard, epoch_ticket, now)
+            .unwrap_err(),
         NotSubmittedReason::StaleIdleEpoch
     );
 }
 
 #[tokio::test]
-async fn expiration_before_commit_is_definitively_not_submitted() {
+async fn deadline_is_checked_deterministically_before_the_effect_boundary() {
     let active_turn = AsyncMutex::new(None);
     let guard = active_turn.lock().await;
     let controller = AdmissionController::default();
+    let now = Instant::now();
     let ticket = controller
         .issue_ticket(
             &guard,
             request(
                 InputOrigin::HumanExternalClient,
+                InputEffect::StartTurn,
                 SubmissionAuthority::ExternalClient,
                 None,
             ),
+            now,
+            Duration::from_secs(/* secs */ 5),
         )
         .expect("ticket");
 
     assert_eq!(
-        ticket.expire(),
-        SubmissionResolution::NotSubmitted(NotSubmittedReason::TicketExpired)
+        controller
+            .enter_effect_boundary(&guard, ticket, now + Duration::from_secs(/* secs */ 5),)
+            .unwrap_err(),
+        NotSubmittedReason::TicketExpired
     );
 }
 
 #[tokio::test]
-async fn waiter_loss_after_commit_is_an_unknown_result_not_busy() {
+async fn waiter_loss_after_effect_boundary_is_unknown_not_busy() {
     let active_turn = AsyncMutex::new(None);
     let guard = active_turn.lock().await;
     let controller = AdmissionController::default();
-    let ticket = controller
-        .issue_ticket(
-            &guard,
-            request(
-                InputOrigin::HumanExternalClient,
-                SubmissionAuthority::ExternalClient,
-                None,
-            ),
-        )
-        .expect("ticket");
-    let committed = controller.commit(&guard, ticket).expect("commit");
+    let now = Instant::now();
+    let ticket = issue(
+        &controller,
+        &guard,
+        request(
+            InputOrigin::HumanExternalClient,
+            InputEffect::StartTurn,
+            SubmissionAuthority::ExternalClient,
+            None,
+        ),
+        now,
+    )
+    .expect("ticket");
+    let boundary = controller
+        .enter_effect_boundary(&guard, ticket, now)
+        .expect("effect boundary");
 
     assert_eq!(
-        committed.result_unknown(),
+        boundary.result_unknown(),
         SubmissionResolution::UnknownResult
     );
 }
 
 #[tokio::test]
-async fn stopping_fence_requires_the_exact_finalizer() {
+async fn stopping_fence_rejects_replacement_and_stale_finalizers() {
     let active_turn = AsyncMutex::new(None);
-    let guard = active_turn.lock().await;
+    let mut guard = active_turn.lock().await;
     let controller = AdmissionController::default();
-    let generation = controller.begin_stopping(&guard, "turn-a".to_string());
+    let generation = controller
+        .begin_stopping(&guard, "turn-a".to_string())
+        .expect("stopping fence");
 
-    assert!(!controller.finish_stopping(&guard, "turn-b", generation));
     assert_eq!(
-        controller
-            .issue_ticket(
-                &guard,
-                request(
-                    InputOrigin::HumanExternalClient,
-                    SubmissionAuthority::ExternalClient,
-                    None,
-                ),
-            )
-            .unwrap_err(),
-        NotSubmittedReason::Stopping
+        controller.begin_stopping(&guard, "turn-b".to_string()),
+        Err(BeginStoppingError::AlreadyStopping)
     );
+    assert!(!controller.finish_stopping(&guard, "turn-b", generation));
+    assert!(!controller.finish_stopping(&guard, "turn-a", generation + 1));
+    *guard = Some(ActiveTurn::default());
+    assert!(!controller.finish_stopping(&guard, "turn-a", generation));
+    *guard = None;
     assert!(controller.finish_stopping(&guard, "turn-a", generation));
+    assert!(!controller.finish_stopping(&guard, "turn-a", generation));
+    let successor_generation = controller
+        .begin_stopping(&guard, "turn-b".to_string())
+        .expect("successor fence");
+    assert!(!controller.finish_stopping(&guard, "turn-a", generation));
+    assert!(controller.finish_stopping(&guard, "turn-b", successor_generation));
 }
