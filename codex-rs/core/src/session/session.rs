@@ -14,6 +14,7 @@ use crate::responses_metadata::CodexResponsesMetadata;
 use crate::responses_metadata::CodexResponsesRequestKind;
 use crate::shell_snapshot::ShellSnapshot;
 use crate::state::ActiveTurn;
+use crate::voice_control::AdmissionController;
 use codex_extension_api::ExtensionDataInit;
 use codex_http_client::ClientRouteClass;
 use codex_http_client::RouteAwareClientPool;
@@ -67,6 +68,8 @@ pub(crate) struct Session {
     pub(crate) conversation: Arc<RealtimeConversationManager>,
     pub(crate) realtime_history: Option<Mutex<crate::realtime_history::RealtimeHistoryState>>,
     pub(crate) active_turn: Mutex<Option<ActiveTurn>>,
+    /// Must only be entered while `active_turn` is locked, preserving L -> A ordering.
+    pub(crate) voice_admission: AdmissionController,
     pub(crate) async_hook_results: async_channel::Receiver<HookCompletedEvent>,
     pub(crate) input_queue: InputQueue,
     pub(crate) guardian_review_session: GuardianReviewSessionManager,
@@ -1507,6 +1510,7 @@ impl Session {
                     && services.live_thread.is_some())
                 .then(|| Mutex::new(Default::default())),
                 active_turn: Mutex::new(None),
+                voice_admission: AdmissionController::default(),
                 async_hook_results,
                 input_queue: InputQueue::new(),
                 guardian_review_session: GuardianReviewSessionManager::default(),
