@@ -1,0 +1,532 @@
+{
+  "pin": "6f39a47bb3b04de4c804187bfbf55edc56939aab",
+  "base_tree": "9d67c53fd490cb4e01fbd82974dded2a0aeee6dc",
+  "stages": [
+    {
+      "stage": 1,
+      "commit": "31912839e0567787e46ec2f599ff44bbe2f281e0",
+      "tree": "198fc7cc82308ae0374800fa974c095c5c5b6f6d",
+      "patch": "patches/01-implementation.diff",
+      "patch_sha256": "4fb5dccb1fc524f15b359be078113d4c07db58f5f3fd13ca662e015bfd3402b6",
+      "files": [
+        {
+          "path": "codex-rs/app-server/src/extensions.rs",
+          "mode": "100644",
+          "git_blob": "048872a5036b2515d9d232c8d784eb56652167fd",
+          "sha256": "11764e18e292ca3a34f02c634288fe5aac36714422d25b0edb61c9dfccf61fe3"
+        },
+        {
+          "path": "codex-rs/app-server/src/voice_admission.rs",
+          "mode": "100644",
+          "git_blob": "5d7e4fa09c425d40b172c0e881c11ce579eefd6b",
+          "sha256": "e1f458ed7f24298dbd7a404192318fcacbd0392579d1b7956a910fda19ffa7f3"
+        },
+        {
+          "path": "codex-rs/core/src/lib.rs",
+          "mode": "100644",
+          "git_blob": "cdc1f5752a47e9d01cc887ad650b0a5b0116ad3d",
+          "sha256": "92ea43c59aca598581b77f2e785dc35d005a1107272d14afb13b5995e9fee37a"
+        },
+        {
+          "path": "codex-rs/core/src/realtime_conversation.rs",
+          "mode": "100644",
+          "git_blob": "c1cb06a46a1c7247c98dd18ad0752f6bc1728b18",
+          "sha256": "39bdce739621f5c331da40be7bbbc08733179893e03128390ee7b8887de71be4"
+        },
+        {
+          "path": "codex-rs/core/src/realtime_voice_admission.rs",
+          "mode": "100644",
+          "git_blob": "9e1d8e3fc642cf3fbffe9e63b9786357567ee7f9",
+          "sha256": "f5bb4bc076df2623b600567c4fbd4c3f40307406d53035c5056a2b38cc76c26a"
+        },
+        {
+          "path": "codex-rs/core/src/realtime_voice_admission_tests.rs",
+          "mode": "100644",
+          "git_blob": "2b3477b74a1cc7a752b2088177ebe2e355654bda",
+          "sha256": "924e63175688eae77ea17f08f7f68c7f4b9ef74d2fc33caac5c3de62d3cd321b"
+        },
+        {
+          "path": "codex-rs/ext/extension-api/src/lib.rs",
+          "mode": "100644",
+          "git_blob": "94431a1e31d494b1ac50ff897d3a93c62ad91b07",
+          "sha256": "07943f3ffc5142fc18a3256e9b81d4f6ca5e81ac69023a75c30ff88e318d59b8"
+        },
+        {
+          "path": "codex-rs/ext/extension-api/src/registry.rs",
+          "mode": "100644",
+          "git_blob": "e4595fb35a08f73a9013fa26906da803eee6f820",
+          "sha256": "abd11eba73021f9374a8e4c7020440fdaa51acc8c6726e8960af5261b275d6f9"
+        },
+        {
+          "path": "codex-rs/ext/extension-api/src/voice_admission.rs",
+          "mode": "100644",
+          "git_blob": "98a04b140bfc5c2994b7b13a83f3452e3527cdf2",
+          "sha256": "daccfd8fd410e0070fb2bb7098003a5e7251e0750e3dee57caa32142a42985ba"
+        },
+        {
+          "path": "codex-rs/ext/queue/src/lib.rs",
+          "mode": "100644",
+          "git_blob": "63fc8d0ca92e41bcb8d52ba5b7b5ec97eaeb4c20",
+          "sha256": "25628e8e31d29c1970f2f91220dcf6ef2d3e4b96968980954bb6729b913a1227"
+        },
+        {
+          "path": "codex-rs/ext/queue/src/service.rs",
+          "mode": "100644",
+          "git_blob": "898f0e11e6caff5fdbaa5c2ea20e45d5c7e17dd8",
+          "sha256": "42dab0d252f55cebc815f6a0bf496f2b157d6ae0355aaaaca48f11090865b2e4"
+        },
+        {
+          "path": "codex-rs/ext/queue/tests/queue_service.rs",
+          "mode": "100644",
+          "git_blob": "7b6554f64eb6f90414649c39511fec2a600f240c",
+          "sha256": "a20a49c9af10cf3d887946c502240fc7ac14e0abcd7db30be805ac3b02719517"
+        },
+        {
+          "path": "codex-rs/state/queue_migrations/0003_queued_submission_receipts.sql",
+          "mode": "100644",
+          "git_blob": "ac1ae0efdfd22062e686c9f6a1e4d231bdf4e1cb",
+          "sha256": "045ceccac597de90a2359f7c6c68b5eb6834fa98c425b90df02341bfd5440bee"
+        },
+        {
+          "path": "codex-rs/state/src/lib.rs",
+          "mode": "100644",
+          "git_blob": "e853170bc3f2a0ae72b4c5e1460767faf40f98f4",
+          "sha256": "8c863150985d01845859cab095a0753c97c3cfb8f41cc3e6a9ce2d9daae6a24a"
+        },
+        {
+          "path": "codex-rs/state/src/model/mod.rs",
+          "mode": "100644",
+          "git_blob": "1aa1b0a8f6f94563db8d3fb2704eadfdbbb8cdbc",
+          "sha256": "532e6c21ea635c81b53744269b7f2adab8074ad52f1a564e82822d67c67b0435"
+        },
+        {
+          "path": "codex-rs/state/src/model/queued_item.rs",
+          "mode": "100644",
+          "git_blob": "9c93260388563c198ccd75efce9b8456e28d6a7d",
+          "sha256": "1d67a170c9ba4bce7cda851f483e4f8f1b9a0364230770e0e03b3477b8b9a285"
+        },
+        {
+          "path": "codex-rs/state/src/runtime/queued_items.rs",
+          "mode": "100644",
+          "git_blob": "e64b5113711405e3038ea95ed06788e647f4f767",
+          "sha256": "be9dadd8c70812ed987ec21f6310935d4bc6ccc6ae69b383d517e7a8c461b124"
+        },
+        {
+          "path": "codex-rs/state/src/runtime/queued_items_tests.rs",
+          "mode": "100644",
+          "git_blob": "2022f5a113bc91a46c8dcfa3fb37ae44b3295b7e",
+          "sha256": "798590013e2f0903354d06b45e016fcc72a29413351090d6fdda7e5d5928d3dc"
+        },
+        {
+          "path": "codex-rs/state/src/runtime/queued_voice.rs",
+          "mode": "100644",
+          "git_blob": "487fcd4adda92cb736b7ea294ad2e3bd48301c12",
+          "sha256": "6a29929aff80e4773dfe5a6af373dd66ffb3fd3e150d0cb1fff1c108154d1660"
+        },
+        {
+          "path": "codex-rs/thread-store/src/lib.rs",
+          "mode": "100644",
+          "git_blob": "800581c63f0ef33d89d957b7b9593acbfb946f32",
+          "sha256": "1839eeb380c77d491f0ffabd4ec648943ec16b62ac11106fc4022d6c1925eb3c"
+        },
+        {
+          "path": "codex-rs/thread-store/src/queue_store.rs",
+          "mode": "100644",
+          "git_blob": "414d7b637eb192a57b06882648dc3afe137d3abe",
+          "sha256": "53231b27c7398f4e595c92b6bc4229afff7fc899c50745794764186670674f73"
+        },
+        {
+          "path": "fdv/BUILD-REQUIREMENTS.md",
+          "mode": "100644",
+          "git_blob": "1ac8c6bd3237f5050cbf74ddf04878087aa8f5ca",
+          "sha256": "8cef1e98d6015b0aa4218b69a763510cc00140920dbffe36fd4b6c5aba4bc34b"
+        },
+        {
+          "path": "fdv/e2e_fake.py",
+          "mode": "100644",
+          "git_blob": "d2d618c4f835b2164f9c5ce98adad9d3708e139e",
+          "sha256": "36eb440c56d889fb32e2268bf3cfdcda651697e8ec4e1fec687565e5aad54494"
+        },
+        {
+          "path": "fdv/e2e_playback.mjs",
+          "mode": "100644",
+          "git_blob": "e6a08988fcc18176790d722eee3990c18b9f319d",
+          "sha256": "0b775e6d62eb0c932db8cde9e81b651b417f9e3c8578d931be12ce4f58b5f4e7"
+        },
+        {
+          "path": "fdv/native-boundary/MANIFEST-SHA256.txt",
+          "mode": "100644",
+          "git_blob": "2489412df3a980db00228be96a8aafc646752f45",
+          "sha256": "596da5b42bea557d4df5cb540059a1cd12221def5c75ec05a1c558f7b631d94f"
+        },
+        {
+          "path": "fdv/native-boundary/README.md",
+          "mode": "100644",
+          "git_blob": "a841d832d00f75349177c453d3a0646934cba851",
+          "sha256": "52b504ccc437a4b0a82361213d3e334a21110cf8629e40472b0382c3c210c234"
+        },
+        {
+          "path": "fdv/native-boundary/fake-adapter.mjs",
+          "mode": "100644",
+          "git_blob": "8cb3485bc1690103e5295ae4d87eda01eb27851d",
+          "sha256": "52f93656b83288dad3d1034ad45c8f621ede1baf93f90fd79a5f494794c0aaf5"
+        },
+        {
+          "path": "fdv/native-boundary/index.d.ts",
+          "mode": "100644",
+          "git_blob": "1fffb307f622820b5dae338d9315a8da374d0baa",
+          "sha256": "ce60b74e055dbeedd43c1d75e4cb9478eed3446fb1033975516f744f44bb047b"
+        },
+        {
+          "path": "fdv/native-boundary/index.mjs",
+          "mode": "100644",
+          "git_blob": "4f25df9758d0b6c2a0d70ec056595d31c7b9d557",
+          "sha256": "c2894126589bfc65be865f34b014c584ab347ee186fb72000d248d67e9d6cdab"
+        },
+        {
+          "path": "fdv/native-boundary/run-proof.py",
+          "mode": "100644",
+          "git_blob": "56f84e44ec6bda90a6adf8de6b81d147bfa510af",
+          "sha256": "2a48f677db399141d8075ae5fc20fa9c863af88e2b6bce7163e519c8bfac3159"
+        },
+        {
+          "path": "fdv/native-boundary/test-native-boundary.mjs",
+          "mode": "100644",
+          "git_blob": "0eac9003ea9e69f7ef5f9734a271de234a026201",
+          "sha256": "61e2e4b8ef35ec8ea569e903d70853f078e979b26a1a35ea227066aa2aeb0de6"
+        },
+        {
+          "path": "fdv/producer/ADMISSION-CONTRACT.md",
+          "mode": "100644",
+          "git_blob": "31bc8d9169f34c5f12fea1a565db96208707d541",
+          "sha256": "c770fd701f3407268594a31d3544a6847c0e3a06b78f464f8ca4d115e3bad883"
+        },
+        {
+          "path": "fdv/producer/ADMISSION-SHA256SUMS.json",
+          "mode": "100644",
+          "git_blob": "5ecbd1f62a4606e772d8bea7cb97351c7ee28d53",
+          "sha256": "ce327984823b1eed65cb80003c2569e33e7d936f4fed354a4dfc3d5049dc5a59"
+        },
+        {
+          "path": "fdv/producer/CLIENT-ID-SHAPE-OBSERVATION.json",
+          "mode": "100644",
+          "git_blob": "de92e62a9a6d185d36bb31215c1caa83ae666971",
+          "sha256": "06df739207baadd176f58c97d02a90a9db08d5fe8d70b2e89d399579f674a7de"
+        },
+        {
+          "path": "fdv/producer/PRESERVATION-RECEIPT.json",
+          "mode": "100644",
+          "git_blob": "0bcacb738fe102ea6b32d72e2e11a36cc2d52ec3",
+          "sha256": "7a365216126d632878e9a38aaff632975eb3940cc1700a03504ef153380af88f"
+        },
+        {
+          "path": "fdv/producer/admission_gate.py",
+          "mode": "100644",
+          "git_blob": "9fb7fae006d728fd0d7e1cfbed11f97308a08865",
+          "sha256": "a7b0718ea9d042c3029d7cbdf0a791883256d22a2efb3b673249413f2ad55943"
+        },
+        {
+          "path": "fdv/producer/crash_worker.py",
+          "mode": "100644",
+          "git_blob": "952e045f65a90eaba70429096805de2f4305a713",
+          "sha256": "411f61cd0cb56e0fe60d925c80446ea6054a686985c674fe2c2c837654855ad1"
+        },
+        {
+          "path": "fdv/producer/final_producer.py",
+          "mode": "100644",
+          "git_blob": "4a74263abab215682803612ba858e00b6a59ce4b",
+          "sha256": "7843d6e3bf51c9a903f43c81d16f01363622f231c7229b3f023d7e4875e8e689"
+        },
+        {
+          "path": "fdv/producer/final_producer_base.py",
+          "mode": "100644",
+          "git_blob": "2c1222269069a20b79820314bafa1eec85aeb674",
+          "sha256": "3d62a2b36d96eeda16b9ec50eda1b02ef2ee351e8cb2b054ecb7d83362b51f57"
+        },
+        {
+          "path": "fdv/producer/historical_freeze.json",
+          "mode": "100644",
+          "git_blob": "7a0e16a30e41ad6f4a9d5c7361a368278e90d966",
+          "sha256": "7a7c48d0c9d67b4f1e281306264b40e240d7c51e380a5cff6ec0aaf0df624bcb"
+        },
+        {
+          "path": "fdv/producer/source-schema.json",
+          "mode": "100644",
+          "git_blob": "2ea86d3bffa00baf89203a4f00974c1815cf56a6",
+          "sha256": "b3a68a9ed51f3cc0c48e6b25dfdfb55d953feaf060294b6a0c448eec4e3e6335"
+        },
+        {
+          "path": "fdv/producer/test_admission.py",
+          "mode": "100644",
+          "git_blob": "26c52473606a90daa9a1bd03253aeccf028fd1d2",
+          "sha256": "0ba5f4ee098405cc954f3868abb53e920f0a5a7651e267c6dcf83a9d05aefecd"
+        },
+        {
+          "path": "fdv/producer/test_producer.py",
+          "mode": "100644",
+          "git_blob": "7a9c140bb3e5c45806a359084641238bb499b013",
+          "sha256": "747b2ffb69aef49c22714073fa3b68b70799f226305904b7e380c795357d13c9"
+        },
+        {
+          "path": "fdv/queue_sql_harness.py",
+          "mode": "100644",
+          "git_blob": "3435f1858951e6c59dd6dba3c0a49b7ef08a1175",
+          "sha256": "e29856ece8bf95c18594964e902cefaa22e675a467bcdeb414e2c02b2ac83197"
+        }
+      ]
+    },
+    {
+      "stage": 2,
+      "commit": "64aff5fac88f3aba7f50d83f5bfc0a4c4f2c506c",
+      "tree": "67598a1dacd29aed4a43c6505c018f344a48ea8f",
+      "patch": "patches/02-routing-session.diff",
+      "patch_sha256": "c554e6cf2e33b3720c876b1f01eb05e18e15c1fd9c56a5181051bdbdd10df52f",
+      "files": [
+        {
+          "path": "codex-rs/app-server/src/voice_admission.rs",
+          "mode": "100644",
+          "git_blob": "290bc5c553a44534497bdac719bf848e32db5399",
+          "sha256": "bf8ea0d73eb8c687ba7a691c1d5d7b74b5106a31d0e80bcb2da38e57f5eb26ca"
+        },
+        {
+          "path": "codex-rs/core/src/lib.rs",
+          "mode": "100644",
+          "git_blob": "ac23001875161bf39ba3551fc86b43d2af4cf8a3",
+          "sha256": "6d7ae704651765c4d8e991ca626e73c7020d7870a3a5925235da3ed38d972c93"
+        },
+        {
+          "path": "codex-rs/core/src/realtime_conversation.rs",
+          "mode": "100644",
+          "git_blob": "31b56f07efbfb36d4cb5308475c96429f61b9279",
+          "sha256": "cec71ac2f5e99ae3e7715a78334a2f601171a505ac00d158d849c49fc8f38242"
+        },
+        {
+          "path": "codex-rs/core/src/realtime_conversation_tests.rs",
+          "mode": "100644",
+          "git_blob": "f0d0b8f33778a231d915fc1b2892521a32325c83",
+          "sha256": "0576a8e9ce7e0c3d61a171e330c2d823677aa3893446dcc1c47a666e38d472d8"
+        },
+        {
+          "path": "codex-rs/core/src/realtime_voice_manager_tests.rs",
+          "mode": "100644",
+          "git_blob": "fdd7a98843c274316554c2067d97430abc22fbfb",
+          "sha256": "04f11556b2f9891ea694f902eb6abad4d8d3c24dbaa9c253aa79ba1fb6d8972e"
+        },
+        {
+          "path": "codex-rs/core/src/realtime_voice_routing.rs",
+          "mode": "100644",
+          "git_blob": "04dd5380b5ef4c373d1926b195b98603c640bec8",
+          "sha256": "46e93d18cb012ef17114730cd13bcf9ec913f38dba64bcd6181666852b34ccca"
+        },
+        {
+          "path": "codex-rs/core/src/realtime_voice_routing_tests.rs",
+          "mode": "100644",
+          "git_blob": "2986c147253b8f717a426f1fb21acb28c7ce32d2",
+          "sha256": "3b6225cae85c2d958f93916373f2e170d65165a8879208762cbdbfe2bf2ba585"
+        },
+        {
+          "path": "codex-rs/core/src/session/mod.rs",
+          "mode": "100644",
+          "git_blob": "1df36e67fda5ff85be9646f7b40d60c014a8ea23",
+          "sha256": "6857122d6633f15f34c12c7a7b99e1b06ed232ec9e530551d1fed9e53aa794ae"
+        },
+        {
+          "path": "codex-rs/core/src/session/turn_input.rs",
+          "mode": "100644",
+          "git_blob": "93a4947c2909a2afd6bd11dc58d97236bd034146",
+          "sha256": "7d76afbe0d40b9f24e61f4dd7c9ad3c3052493b1cc593301c1308b040766a00a"
+        },
+        {
+          "path": "codex-rs/ext/queue/src/service.rs",
+          "mode": "100644",
+          "git_blob": "692b4913a4498697a9ede1f2dbd5ee84cc8d23f4",
+          "sha256": "662d8b8697b6b6e2f1301f23581c6f98b5e8967325d43ac472f50dc958240f8a"
+        },
+        {
+          "path": "codex-rs/ext/queue/tests/queue_service.rs",
+          "mode": "100644",
+          "git_blob": "815e8604e76403fc5c6cd58a654883998001f7c0",
+          "sha256": "ed804e4837f583ccdc847f836266842765faa64fa78f4cfd18ee0b2ad90bec7c"
+        },
+        {
+          "path": "codex-rs/state/queue_migrations/0004_voice_native_session.sql",
+          "mode": "100644",
+          "git_blob": "2abc7ea4e0a1622f64bdab88c0804d2e9acb644e",
+          "sha256": "65ac974584ccbadfb74150e1c5e3fb63b6a855ca0139283ef6646808a7a32b08"
+        },
+        {
+          "path": "codex-rs/state/src/model/queued_item.rs",
+          "mode": "100644",
+          "git_blob": "898332552e78dfa5c09af4d963828b90c773beb3",
+          "sha256": "a081b68a6ae9cc8e1af4c0594f27c2611853bfadf534b9d3524f3e2b14ee504e"
+        },
+        {
+          "path": "codex-rs/state/src/runtime/queued_items_tests.rs",
+          "mode": "100644",
+          "git_blob": "ba5a2e0e580eb1c4fc7bf55403a5a39a3d4a18aa",
+          "sha256": "a7838a706d4b05093761772d9b6cbffd7e6ed1d86b074ca08f07345f3be8b1e9"
+        },
+        {
+          "path": "codex-rs/state/src/runtime/queued_voice.rs",
+          "mode": "100644",
+          "git_blob": "4cc13b7d770d4caf225f0bdd8fe960788dcfd0a1",
+          "sha256": "07a3ef3b0c40aef398259faa8cf44417b1658d1f75afddab0ddee93caf8b37b7"
+        },
+        {
+          "path": "codex-rs/thread-store/src/queue_store.rs",
+          "mode": "100644",
+          "git_blob": "2025e669aae1cbefc497c61f0d68f8a156441990",
+          "sha256": "60bdda8b2e9d711cad8e1068e76e570cd5937c49f8423ce8cc73a518881abe92"
+        },
+        {
+          "path": "fdv/e2e_fake.py",
+          "mode": "100644",
+          "git_blob": "41a9e6e5e34f83a94e13e1ff4b9067e95a7f0135",
+          "sha256": "96f0eb0cfb67340c11144026284b82e02223c27f3f1a60145a69e598dd65ada6"
+        },
+        {
+          "path": "fdv/e2e_playback.mjs",
+          "mode": "100644",
+          "git_blob": "e294ded33ccfede7bc77fefde1a361d993533815",
+          "sha256": "416eaaaa24fc35a470e54bfd931b65571f0d03edef451bcef6468c6f5d8f7b8b"
+        },
+        {
+          "path": "fdv/native-boundary/MANIFEST-SHA256.txt",
+          "mode": "100644",
+          "git_blob": "c4d8c387cf29247accd8bb76c83c38bd4b1d9f19",
+          "sha256": "c1986963f7357537dfea211a61518aab56ce1a9ccacfa6ec97b92c9945752e52"
+        },
+        {
+          "path": "fdv/native-boundary/README.md",
+          "mode": "100644",
+          "git_blob": "1e999a87cf1c4f4093096852ad49c8905aa12547",
+          "sha256": "9cc59deb8adb6997441c4855bd88bf5328c2f08320d6393c57c35a515f36f8a2"
+        },
+        {
+          "path": "fdv/native-boundary/fake-adapter.mjs",
+          "mode": "100644",
+          "git_blob": "a687cad0c6beb62673698b9303d1e639aa0a26b2",
+          "sha256": "f351b9ce030717f446f6af6a5bd375894d631d6e7a9cff453546c96f43b5e77d"
+        },
+        {
+          "path": "fdv/native-boundary/fixtures/PLAYBACK-EVIDENCE-FAKE.json",
+          "mode": "100644",
+          "git_blob": "f4618aa6f8ca238032bed40e086e9fe82fe1a127",
+          "sha256": "204bc9c907beb7dcf504e1af95a1cc1fd29ed4b1db275157e19f850d25556d91"
+        },
+        {
+          "path": "fdv/native-boundary/index.d.ts",
+          "mode": "100644",
+          "git_blob": "9592b34f5e2b3f63c53003ee3fba73b9a9a9e643",
+          "sha256": "d031dfcf977737647c6ab62a1d61af57497602cad344b8f32d7e61876308d6a6"
+        },
+        {
+          "path": "fdv/native-boundary/index.mjs",
+          "mode": "100644",
+          "git_blob": "c8c98e6c7d52b7f9a2d21d2edc277ce648498659",
+          "sha256": "6b8271d2ea2b999ad2323ca1af80b27bc98c89bedbd491a1b89233c06825703f"
+        },
+        {
+          "path": "fdv/native-boundary/playback-evidence.mjs",
+          "mode": "100644",
+          "git_blob": "957f9887c0f38cf3fd5166330fde0f2e8090def0",
+          "sha256": "21185687917b4800d2f0715a53238f3184400a1840106e25708a08a61b7b9f2d"
+        },
+        {
+          "path": "fdv/native-boundary/run-proof.py",
+          "mode": "100644",
+          "git_blob": "18adf0a4d3aac63719a892e904c70e822dfe55a8",
+          "sha256": "a87b7e8917d19349e567fbb72d961f3edcf92920bbce34f446f8536b0a7b4757"
+        },
+        {
+          "path": "fdv/native-boundary/test-combined-playback.mjs",
+          "mode": "100644",
+          "git_blob": "d19390ac6727a0b900e0ba1f7e9c917ef27cc86d",
+          "sha256": "e2e3d25d33f9016ebe9725d67db4cb7843f7cb050f5a93fc1c3018630836659f"
+        },
+        {
+          "path": "fdv/producer/ADMISSION-CONTRACT.md",
+          "mode": "100644",
+          "git_blob": "387c47407a4a2a3ed4f900f0158939b118cc6640",
+          "sha256": "b4efa548ab3aa75217b1ed69f5d5c862407fe3449ce3d7f472488a96adbc83b4"
+        },
+        {
+          "path": "fdv/producer/ADMISSION-SHA256SUMS.json",
+          "mode": "100644",
+          "git_blob": "a3228223ad0ce418c6192ab931af2b9f12099bf6",
+          "sha256": "8c00cfdb93d805c542092189108c36b74af4d0da96b74b87983727b3e27b92ef"
+        },
+        {
+          "path": "fdv/producer/admission_gate.py",
+          "mode": "100644",
+          "git_blob": "9b45c6a65d545677a7fc23ceef569ec7cfd3db9b",
+          "sha256": "4c77f1b702e188da3b9ebda6f1070e716ebbd23191f37f83e2d35f08b4b9b9a9"
+        },
+        {
+          "path": "fdv/producer/final_producer.py",
+          "mode": "100644",
+          "git_blob": "5eb9a42eb5e9c1722e20cb61a5b41874ed8f7580",
+          "sha256": "0d3ce21e8dee2e8431ad8df33e8cdef906b73c733175aa4661e9a8759b7599f1"
+        },
+        {
+          "path": "fdv/producer/test_admission.py",
+          "mode": "100644",
+          "git_blob": "5ecb4b5f6ea17871e927b23aa1cfed665d1980cc",
+          "sha256": "e3a9733dd7e00c08f315a4b093cd654b5e56e7949b2b0456909688f8dd510918"
+        },
+        {
+          "path": "fdv/queue_sql_harness.py",
+          "mode": "100644",
+          "git_blob": "1194402406d989807b4f54a715028544e5e6e164",
+          "sha256": "554a284845ceaef3f3e7693cf43d943c724b04238c6b00c9d253d7e9fa2c48ac"
+        }
+      ]
+    },
+    {
+      "stage": 3,
+      "commit": "ad0709be78da44b3f7e737d1d71acab3e070b452",
+      "tree": "6331ed2310f9b690344947dc2b723a263e443bf6",
+      "patch": "patches/03-turn-aborted.diff",
+      "patch_sha256": "18506bfeccecd48917da1fe26234bccf8be189a6423c0965e36091005d4d5911",
+      "files": [
+        {
+          "path": "codex-rs/core/src/realtime_conversation.rs",
+          "mode": "100644",
+          "git_blob": "8b24e564a71907270aa1d0c8a618571b4838fef4",
+          "sha256": "69392c70b360deb5cf7795520a4234973c8ab6e6c74c0b1104d6e10f9e9a2d85"
+        },
+        {
+          "path": "codex-rs/core/src/realtime_conversation_tests.rs",
+          "mode": "100644",
+          "git_blob": "3aca4415569c3e53e51e58c22b3328e0e499d386",
+          "sha256": "f7e853378fc13e91f6b909c37dccbbd5dc25734e57da4c259dc96bfa6617c14a"
+        },
+        {
+          "path": "codex-rs/core/src/realtime_voice_manager_tests.rs",
+          "mode": "100644",
+          "git_blob": "62b71c4cc1fca650a21f7fc1fb8bcaaedf887745",
+          "sha256": "7dcb00104537df790a2d4ecc0591c7b26318e9026876774d9c8a0a955192e4ce"
+        },
+        {
+          "path": "codex-rs/core/src/realtime_voice_routing.rs",
+          "mode": "100644",
+          "git_blob": "1c6e6f352f3df30cbfc635e0603ed0bc1dccb3b1",
+          "sha256": "fc21be57cf9cc38e84a27bc16ff340af7c2c6762f7f563ea11d7eedd681189e5"
+        },
+        {
+          "path": "codex-rs/core/src/realtime_voice_routing_tests.rs",
+          "mode": "100644",
+          "git_blob": "ae1cb0d011faad1c4c6de940c1d9598848ab3baa",
+          "sha256": "5d88a11c522e8085e838efc96810dbf006a048786f454a339779fbbb67c2c6d1"
+        },
+        {
+          "path": "codex-rs/core/src/session/mod.rs",
+          "mode": "100644",
+          "git_blob": "f1e1314af1524f4e5841f53f06b739331577ce45",
+          "sha256": "51894c86edcec8f44a4f895ba3d1034a7b0c26082b9464f91c00cfe3a13ac570"
+        }
+      ]
+    }
+  ],
+  "compiler_corrections": []
+}

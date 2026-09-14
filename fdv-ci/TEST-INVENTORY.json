@@ -1,0 +1,605 @@
+{
+  "schema_version": 1,
+  "classification": "F_SOURCE_ONLY_NOT_RUST_EXECUTION",
+  "source_candidate": "/home/vanius_astra/residence-01/voice-abort-cleanup-20260914/candidate",
+  "source_candidate_commit": "b1c4d28d0a16060ce606011d007f29063ebe6ce6",
+  "upstream_pin_expected": "6f39a47bb3b04de4c804187bfbf55edc56939aab",
+  "toolchain_expected": "1.95.0",
+  "source_test_functions_expected": 58,
+  "candidate_added_test_functions_expected": 17,
+  "abort_micro_delta_test_functions_expected": 6,
+  "tests_discovered_by_compiled_runner": 0,
+  "tests_executed": 0,
+  "tests_passed": 0,
+  "tests_failed": 0,
+  "discovery_status": "NOT_RUN",
+  "execution_status": "NOT_RUN",
+  "compiler_status": "NOT_RUN",
+  "not_run_reason": "Full source/toolchain acquisition blocked by DNS in this window, as reported by root executor. This inventory did not execute network or compiler commands.",
+  "counting_rule": "Source function enumeration is not compiler discovery or proof of execution. Zero execution does not imply PASS; zero failed tests while not run is not a successful verdict.",
+  "modules": [
+    {
+      "crate": "codex-state",
+      "module_or_integration_binary": "runtime::queued_items::tests",
+      "source_file": "/home/vanius_astra/residence-01/voice-abort-cleanup-20260914/candidate/codex-rs/state/src/runtime/queued_items_tests.rs",
+      "source_sha256": "a7838a706d4b05093761772d9b6cbffd7e6ed1d86b074ca08f07345f3be8b1e9",
+      "source_test_functions_expected": 11,
+      "candidate_added_functions": 4,
+      "test_names": [
+        "runtime::queued_items::tests::voice_origin_replay_cannot_replace_input_or_recreate_a_started_item",
+        "runtime::queued_items::tests::voice_claim_survives_restart_and_only_positive_reconciliation_dequeues",
+        "runtime::queued_items::tests::voice_busy_release_is_attempt_scoped_and_cancellation_keeps_tombstone",
+        "runtime::queued_items::tests::migrating_receipts_cannot_invent_a_native_session",
+        "runtime::queued_items::tests::competing_runtimes_preserve_fifo_queue_order",
+        "runtime::queued_items::tests::migrating_existing_queue_backfills_thread_revisions",
+        "runtime::queued_items::tests::queue_revisions_identify_changed_threads_after_updates_and_deletions",
+        "runtime::queued_items::tests::fifo_dispatch_preserves_edits_reordering_and_pagination",
+        "runtime::queued_items::tests::queue_operations_cannot_mutate_another_threads_messages",
+        "runtime::queued_items::tests::deleting_a_thread_removes_its_queue",
+        "runtime::queued_items::tests::concurrent_inserts_enforce_the_queue_limit"
+      ]
+    },
+    {
+      "crate": "codex-queue-extension",
+      "module_or_integration_binary": "queue_service",
+      "source_file": "/home/vanius_astra/residence-01/voice-abort-cleanup-20260914/candidate/codex-rs/ext/queue/tests/queue_service.rs",
+      "source_sha256": "ed804e4837f583ccdc847f836266842765faa64fa78f4cfd18ee0b2ad90bec7c",
+      "source_test_functions_expected": 18,
+      "candidate_added_functions": 1,
+      "test_names": [
+        "voice_manual_and_idle_dispatch_share_durable_receipts",
+        "drain_leaves_persisted_queued_message_for_a_later_start",
+        "queued_input_and_unique_event_ids_round_trip",
+        "editing_reordering_and_deleting_preserve_queue_identity",
+        "starting_a_selected_item_preserves_the_remaining_queue",
+        "starting_a_selected_item_while_active_leaves_it_queued",
+        "interrupted_turns_pause_queued_messages_but_failed_turns_drain_them",
+        "registered_queue_lifecycle_starts_messages_in_fifo_order",
+        "externally_changed_queues_dispatch_independently_and_retry_failed_wakes",
+        "rejected_queue_messages_are_consumed_without_retrying_or_blocking_followups",
+        "explicitly_started_rejected_queue_messages_are_consumed",
+        "local_attachments_are_snapshotted_before_enqueue_and_update",
+        "invalid_local_attachments_do_not_mutate_queue",
+        "non_user_input_cannot_enter_the_user_message_queue",
+        "queued_text_limit_is_enforced_across_all_input_items",
+        "queued_text_limit_counts_characters_and_ignores_non_text_items",
+        "invalid_head_is_skipped_and_a_live_user_turn_is_accepted",
+        "resumed_idle_dispatches_input_without_a_loaded_manager"
+      ]
+    },
+    {
+      "crate": "codex-core",
+      "module_or_integration_binary": "realtime_voice_admission::tests",
+      "source_file": "/home/vanius_astra/residence-01/voice-abort-cleanup-20260914/candidate/codex-rs/core/src/realtime_voice_admission_tests.rs",
+      "source_sha256": "924e63175688eae77ea17f08f7f68c7f4b9ef74d2fc33caac5c3de62d3cd321b",
+      "source_test_functions_expected": 1,
+      "candidate_added_functions": 1,
+      "test_names": [
+        "realtime_voice_admission::tests::identity_depends_on_origin_and_generation_not_text"
+      ]
+    },
+    {
+      "crate": "codex-core",
+      "module_or_integration_binary": "realtime_voice_routing::tests",
+      "source_file": "/home/vanius_astra/residence-01/voice-abort-cleanup-20260914/candidate/codex-rs/core/src/realtime_voice_routing_tests.rs",
+      "source_sha256": "5d88a11c522e8085e838efc96810dbf006a048786f454a339779fbbb67c2c6d1",
+      "source_test_functions_expected": 4,
+      "candidate_added_functions": 4,
+      "test_names": [
+        "realtime_voice_routing::tests::received_is_not_started_and_completion_does_not_consume_pending_origin",
+        "realtime_voice_routing::tests::mismatched_session_and_unknown_client_id_never_gain_routes",
+        "realtime_voice_routing::tests::aborted_origin_keeps_its_tombstone_and_cancels_cloned_emission_tokens",
+        "realtime_voice_routing::tests::completed_origin_cancels_new_emissions_but_retains_successful_final_identity"
+      ]
+    },
+    {
+      "crate": "codex-core",
+      "module_or_integration_binary": "realtime_conversation::strict_routing_tests",
+      "source_file": "/home/vanius_astra/residence-01/voice-abort-cleanup-20260914/candidate/codex-rs/core/src/realtime_voice_manager_tests.rs",
+      "source_sha256": "7dcb00104537df790a2d4ecc0591c7b26318e9026876774d9c8a0a955192e4ce",
+      "source_test_functions_expected": 7,
+      "candidate_added_functions": 7,
+      "test_names": [
+        "realtime_conversation::strict_routing_tests::strict_v1_v2_frameless_arrival_never_rebinds_or_acknowledges_steer",
+        "realtime_conversation::strict_routing_tests::v2_terminal_event_arrives_after_successor_start_and_keeps_each_last_output",
+        "realtime_conversation::strict_routing_tests::frameless_stream_items_and_delayed_completion_are_turn_bound",
+        "realtime_conversation::strict_routing_tests::aborted_event_retires_a_and_preserves_pending_and_started_b",
+        "realtime_conversation::strict_routing_tests::strict_v2_abort_has_no_completion_but_complete_preserves_final_drain",
+        "realtime_conversation::strict_routing_tests::non_strict_aborted_event_preserves_upstream_handoff_state",
+        "realtime_conversation::strict_routing_tests::abort_cancels_an_already_drained_flush_blocked_on_channel_capacity"
+      ]
+    },
+    {
+      "crate": "codex-core",
+      "module_or_integration_binary": "realtime_conversation::tests",
+      "source_file": "/home/vanius_astra/residence-01/voice-abort-cleanup-20260914/candidate/codex-rs/core/src/realtime_conversation_tests.rs",
+      "source_sha256": "f7e853378fc13e91f6b909c37dccbbd5dc25734e57da4c259dc96bfa6617c14a",
+      "source_test_functions_expected": 17,
+      "candidate_added_functions": 0,
+      "test_names": [
+        "realtime_conversation::tests::prefers_handoff_input_transcript_over_active_transcript",
+        "realtime_conversation::tests::extracts_text_from_handoff_request_active_transcript_if_input_missing",
+        "realtime_conversation::tests::wraps_handoff_with_transcript_delta",
+        "realtime_conversation::tests::extracts_text_from_handoff_request_input_transcript_if_messages_missing",
+        "realtime_conversation::tests::ignores_empty_handoff_request_input_transcript",
+        "realtime_conversation::tests::wraps_realtime_delegation_input",
+        "realtime_conversation::tests::wraps_realtime_delegation_input_with_xml_escaping",
+        "realtime_conversation::tests::wraps_realtime_delegation_input_with_xml_escaping_without_transcript",
+        "realtime_conversation::tests::bounds_realtime_delegation_fields_and_keeps_latest_transcript",
+        "realtime_conversation::tests::classifies_outbound_api_failures_as_transport_loss",
+        "realtime_conversation::tests::clears_active_handoff_explicitly",
+        "realtime_conversation::tests::streamed_handoff_preserves_a_bounded_final_tail",
+        "realtime_conversation::tests::streamed_v3_handoff_omits_the_final_message_prefix",
+        "realtime_conversation::tests::uses_quicksilver_alpha_header_for_realtime_v1",
+        "realtime_conversation::tests::omits_quicksilver_alpha_header_for_realtime_v2",
+        "realtime_conversation::tests::uses_frameless_alpha_header_for_realtime_v3",
+        "realtime_conversation::tests::realtime_headers_include_only_non_default_originator"
+      ]
+    }
+  ],
+  "all_58_expected_tests": [
+    {
+      "crate": "codex-state",
+      "binary": "lib",
+      "test_name": "runtime::queued_items::tests::voice_origin_replay_cannot_replace_input_or_recreate_a_started_item"
+    },
+    {
+      "crate": "codex-state",
+      "binary": "lib",
+      "test_name": "runtime::queued_items::tests::voice_claim_survives_restart_and_only_positive_reconciliation_dequeues"
+    },
+    {
+      "crate": "codex-state",
+      "binary": "lib",
+      "test_name": "runtime::queued_items::tests::voice_busy_release_is_attempt_scoped_and_cancellation_keeps_tombstone"
+    },
+    {
+      "crate": "codex-state",
+      "binary": "lib",
+      "test_name": "runtime::queued_items::tests::migrating_receipts_cannot_invent_a_native_session"
+    },
+    {
+      "crate": "codex-state",
+      "binary": "lib",
+      "test_name": "runtime::queued_items::tests::competing_runtimes_preserve_fifo_queue_order"
+    },
+    {
+      "crate": "codex-state",
+      "binary": "lib",
+      "test_name": "runtime::queued_items::tests::migrating_existing_queue_backfills_thread_revisions"
+    },
+    {
+      "crate": "codex-state",
+      "binary": "lib",
+      "test_name": "runtime::queued_items::tests::queue_revisions_identify_changed_threads_after_updates_and_deletions"
+    },
+    {
+      "crate": "codex-state",
+      "binary": "lib",
+      "test_name": "runtime::queued_items::tests::fifo_dispatch_preserves_edits_reordering_and_pagination"
+    },
+    {
+      "crate": "codex-state",
+      "binary": "lib",
+      "test_name": "runtime::queued_items::tests::queue_operations_cannot_mutate_another_threads_messages"
+    },
+    {
+      "crate": "codex-state",
+      "binary": "lib",
+      "test_name": "runtime::queued_items::tests::deleting_a_thread_removes_its_queue"
+    },
+    {
+      "crate": "codex-state",
+      "binary": "lib",
+      "test_name": "runtime::queued_items::tests::concurrent_inserts_enforce_the_queue_limit"
+    },
+    {
+      "crate": "codex-queue-extension",
+      "binary": "queue_service",
+      "test_name": "voice_manual_and_idle_dispatch_share_durable_receipts"
+    },
+    {
+      "crate": "codex-queue-extension",
+      "binary": "queue_service",
+      "test_name": "drain_leaves_persisted_queued_message_for_a_later_start"
+    },
+    {
+      "crate": "codex-queue-extension",
+      "binary": "queue_service",
+      "test_name": "queued_input_and_unique_event_ids_round_trip"
+    },
+    {
+      "crate": "codex-queue-extension",
+      "binary": "queue_service",
+      "test_name": "editing_reordering_and_deleting_preserve_queue_identity"
+    },
+    {
+      "crate": "codex-queue-extension",
+      "binary": "queue_service",
+      "test_name": "starting_a_selected_item_preserves_the_remaining_queue"
+    },
+    {
+      "crate": "codex-queue-extension",
+      "binary": "queue_service",
+      "test_name": "starting_a_selected_item_while_active_leaves_it_queued"
+    },
+    {
+      "crate": "codex-queue-extension",
+      "binary": "queue_service",
+      "test_name": "interrupted_turns_pause_queued_messages_but_failed_turns_drain_them"
+    },
+    {
+      "crate": "codex-queue-extension",
+      "binary": "queue_service",
+      "test_name": "registered_queue_lifecycle_starts_messages_in_fifo_order"
+    },
+    {
+      "crate": "codex-queue-extension",
+      "binary": "queue_service",
+      "test_name": "externally_changed_queues_dispatch_independently_and_retry_failed_wakes"
+    },
+    {
+      "crate": "codex-queue-extension",
+      "binary": "queue_service",
+      "test_name": "rejected_queue_messages_are_consumed_without_retrying_or_blocking_followups"
+    },
+    {
+      "crate": "codex-queue-extension",
+      "binary": "queue_service",
+      "test_name": "explicitly_started_rejected_queue_messages_are_consumed"
+    },
+    {
+      "crate": "codex-queue-extension",
+      "binary": "queue_service",
+      "test_name": "local_attachments_are_snapshotted_before_enqueue_and_update"
+    },
+    {
+      "crate": "codex-queue-extension",
+      "binary": "queue_service",
+      "test_name": "invalid_local_attachments_do_not_mutate_queue"
+    },
+    {
+      "crate": "codex-queue-extension",
+      "binary": "queue_service",
+      "test_name": "non_user_input_cannot_enter_the_user_message_queue"
+    },
+    {
+      "crate": "codex-queue-extension",
+      "binary": "queue_service",
+      "test_name": "queued_text_limit_is_enforced_across_all_input_items"
+    },
+    {
+      "crate": "codex-queue-extension",
+      "binary": "queue_service",
+      "test_name": "queued_text_limit_counts_characters_and_ignores_non_text_items"
+    },
+    {
+      "crate": "codex-queue-extension",
+      "binary": "queue_service",
+      "test_name": "invalid_head_is_skipped_and_a_live_user_turn_is_accepted"
+    },
+    {
+      "crate": "codex-queue-extension",
+      "binary": "queue_service",
+      "test_name": "resumed_idle_dispatches_input_without_a_loaded_manager"
+    },
+    {
+      "crate": "codex-core",
+      "binary": "lib",
+      "test_name": "realtime_voice_admission::tests::identity_depends_on_origin_and_generation_not_text"
+    },
+    {
+      "crate": "codex-core",
+      "binary": "lib",
+      "test_name": "realtime_voice_routing::tests::received_is_not_started_and_completion_does_not_consume_pending_origin"
+    },
+    {
+      "crate": "codex-core",
+      "binary": "lib",
+      "test_name": "realtime_voice_routing::tests::mismatched_session_and_unknown_client_id_never_gain_routes"
+    },
+    {
+      "crate": "codex-core",
+      "binary": "lib",
+      "test_name": "realtime_voice_routing::tests::aborted_origin_keeps_its_tombstone_and_cancels_cloned_emission_tokens"
+    },
+    {
+      "crate": "codex-core",
+      "binary": "lib",
+      "test_name": "realtime_voice_routing::tests::completed_origin_cancels_new_emissions_but_retains_successful_final_identity"
+    },
+    {
+      "crate": "codex-core",
+      "binary": "lib",
+      "test_name": "realtime_conversation::strict_routing_tests::strict_v1_v2_frameless_arrival_never_rebinds_or_acknowledges_steer"
+    },
+    {
+      "crate": "codex-core",
+      "binary": "lib",
+      "test_name": "realtime_conversation::strict_routing_tests::v2_terminal_event_arrives_after_successor_start_and_keeps_each_last_output"
+    },
+    {
+      "crate": "codex-core",
+      "binary": "lib",
+      "test_name": "realtime_conversation::strict_routing_tests::frameless_stream_items_and_delayed_completion_are_turn_bound"
+    },
+    {
+      "crate": "codex-core",
+      "binary": "lib",
+      "test_name": "realtime_conversation::strict_routing_tests::aborted_event_retires_a_and_preserves_pending_and_started_b"
+    },
+    {
+      "crate": "codex-core",
+      "binary": "lib",
+      "test_name": "realtime_conversation::strict_routing_tests::strict_v2_abort_has_no_completion_but_complete_preserves_final_drain"
+    },
+    {
+      "crate": "codex-core",
+      "binary": "lib",
+      "test_name": "realtime_conversation::strict_routing_tests::non_strict_aborted_event_preserves_upstream_handoff_state"
+    },
+    {
+      "crate": "codex-core",
+      "binary": "lib",
+      "test_name": "realtime_conversation::strict_routing_tests::abort_cancels_an_already_drained_flush_blocked_on_channel_capacity"
+    },
+    {
+      "crate": "codex-core",
+      "binary": "lib",
+      "test_name": "realtime_conversation::tests::prefers_handoff_input_transcript_over_active_transcript"
+    },
+    {
+      "crate": "codex-core",
+      "binary": "lib",
+      "test_name": "realtime_conversation::tests::extracts_text_from_handoff_request_active_transcript_if_input_missing"
+    },
+    {
+      "crate": "codex-core",
+      "binary": "lib",
+      "test_name": "realtime_conversation::tests::wraps_handoff_with_transcript_delta"
+    },
+    {
+      "crate": "codex-core",
+      "binary": "lib",
+      "test_name": "realtime_conversation::tests::extracts_text_from_handoff_request_input_transcript_if_messages_missing"
+    },
+    {
+      "crate": "codex-core",
+      "binary": "lib",
+      "test_name": "realtime_conversation::tests::ignores_empty_handoff_request_input_transcript"
+    },
+    {
+      "crate": "codex-core",
+      "binary": "lib",
+      "test_name": "realtime_conversation::tests::wraps_realtime_delegation_input"
+    },
+    {
+      "crate": "codex-core",
+      "binary": "lib",
+      "test_name": "realtime_conversation::tests::wraps_realtime_delegation_input_with_xml_escaping"
+    },
+    {
+      "crate": "codex-core",
+      "binary": "lib",
+      "test_name": "realtime_conversation::tests::wraps_realtime_delegation_input_with_xml_escaping_without_transcript"
+    },
+    {
+      "crate": "codex-core",
+      "binary": "lib",
+      "test_name": "realtime_conversation::tests::bounds_realtime_delegation_fields_and_keeps_latest_transcript"
+    },
+    {
+      "crate": "codex-core",
+      "binary": "lib",
+      "test_name": "realtime_conversation::tests::classifies_outbound_api_failures_as_transport_loss"
+    },
+    {
+      "crate": "codex-core",
+      "binary": "lib",
+      "test_name": "realtime_conversation::tests::clears_active_handoff_explicitly"
+    },
+    {
+      "crate": "codex-core",
+      "binary": "lib",
+      "test_name": "realtime_conversation::tests::streamed_handoff_preserves_a_bounded_final_tail"
+    },
+    {
+      "crate": "codex-core",
+      "binary": "lib",
+      "test_name": "realtime_conversation::tests::streamed_v3_handoff_omits_the_final_message_prefix"
+    },
+    {
+      "crate": "codex-core",
+      "binary": "lib",
+      "test_name": "realtime_conversation::tests::uses_quicksilver_alpha_header_for_realtime_v1"
+    },
+    {
+      "crate": "codex-core",
+      "binary": "lib",
+      "test_name": "realtime_conversation::tests::omits_quicksilver_alpha_header_for_realtime_v2"
+    },
+    {
+      "crate": "codex-core",
+      "binary": "lib",
+      "test_name": "realtime_conversation::tests::uses_frameless_alpha_header_for_realtime_v3"
+    },
+    {
+      "crate": "codex-core",
+      "binary": "lib",
+      "test_name": "realtime_conversation::tests::realtime_headers_include_only_non_default_originator"
+    }
+  ],
+  "new_17_expected_tests": [
+    {
+      "crate": "codex-state",
+      "binary": "lib",
+      "test_name": "runtime::queued_items::tests::voice_origin_replay_cannot_replace_input_or_recreate_a_started_item"
+    },
+    {
+      "crate": "codex-state",
+      "binary": "lib",
+      "test_name": "runtime::queued_items::tests::voice_claim_survives_restart_and_only_positive_reconciliation_dequeues"
+    },
+    {
+      "crate": "codex-state",
+      "binary": "lib",
+      "test_name": "runtime::queued_items::tests::voice_busy_release_is_attempt_scoped_and_cancellation_keeps_tombstone"
+    },
+    {
+      "crate": "codex-state",
+      "binary": "lib",
+      "test_name": "runtime::queued_items::tests::migrating_receipts_cannot_invent_a_native_session"
+    },
+    {
+      "crate": "codex-queue-extension",
+      "binary": "queue_service",
+      "test_name": "voice_manual_and_idle_dispatch_share_durable_receipts"
+    },
+    {
+      "crate": "codex-core",
+      "binary": "lib",
+      "test_name": "realtime_voice_admission::tests::identity_depends_on_origin_and_generation_not_text"
+    },
+    {
+      "crate": "codex-core",
+      "binary": "lib",
+      "test_name": "realtime_voice_routing::tests::received_is_not_started_and_completion_does_not_consume_pending_origin"
+    },
+    {
+      "crate": "codex-core",
+      "binary": "lib",
+      "test_name": "realtime_voice_routing::tests::mismatched_session_and_unknown_client_id_never_gain_routes"
+    },
+    {
+      "crate": "codex-core",
+      "binary": "lib",
+      "test_name": "realtime_voice_routing::tests::aborted_origin_keeps_its_tombstone_and_cancels_cloned_emission_tokens"
+    },
+    {
+      "crate": "codex-core",
+      "binary": "lib",
+      "test_name": "realtime_voice_routing::tests::completed_origin_cancels_new_emissions_but_retains_successful_final_identity"
+    },
+    {
+      "crate": "codex-core",
+      "binary": "lib",
+      "test_name": "realtime_conversation::strict_routing_tests::strict_v1_v2_frameless_arrival_never_rebinds_or_acknowledges_steer"
+    },
+    {
+      "crate": "codex-core",
+      "binary": "lib",
+      "test_name": "realtime_conversation::strict_routing_tests::v2_terminal_event_arrives_after_successor_start_and_keeps_each_last_output"
+    },
+    {
+      "crate": "codex-core",
+      "binary": "lib",
+      "test_name": "realtime_conversation::strict_routing_tests::frameless_stream_items_and_delayed_completion_are_turn_bound"
+    },
+    {
+      "crate": "codex-core",
+      "binary": "lib",
+      "test_name": "realtime_conversation::strict_routing_tests::aborted_event_retires_a_and_preserves_pending_and_started_b"
+    },
+    {
+      "crate": "codex-core",
+      "binary": "lib",
+      "test_name": "realtime_conversation::strict_routing_tests::strict_v2_abort_has_no_completion_but_complete_preserves_final_drain"
+    },
+    {
+      "crate": "codex-core",
+      "binary": "lib",
+      "test_name": "realtime_conversation::strict_routing_tests::non_strict_aborted_event_preserves_upstream_handoff_state"
+    },
+    {
+      "crate": "codex-core",
+      "binary": "lib",
+      "test_name": "realtime_conversation::strict_routing_tests::abort_cancels_an_already_drained_flush_blocked_on_channel_capacity"
+    }
+  ],
+  "six_abort_micro_delta_expected_tests": [
+    {
+      "crate": "codex-core",
+      "binary": "lib",
+      "test_name": "realtime_voice_routing::tests::aborted_origin_keeps_its_tombstone_and_cancels_cloned_emission_tokens"
+    },
+    {
+      "crate": "codex-core",
+      "binary": "lib",
+      "test_name": "realtime_voice_routing::tests::completed_origin_cancels_new_emissions_but_retains_successful_final_identity"
+    },
+    {
+      "crate": "codex-core",
+      "binary": "lib",
+      "test_name": "realtime_conversation::strict_routing_tests::aborted_event_retires_a_and_preserves_pending_and_started_b"
+    },
+    {
+      "crate": "codex-core",
+      "binary": "lib",
+      "test_name": "realtime_conversation::strict_routing_tests::strict_v2_abort_has_no_completion_but_complete_preserves_final_drain"
+    },
+    {
+      "crate": "codex-core",
+      "binary": "lib",
+      "test_name": "realtime_conversation::strict_routing_tests::non_strict_aborted_event_preserves_upstream_handoff_state"
+    },
+    {
+      "crate": "codex-core",
+      "binary": "lib",
+      "test_name": "realtime_conversation::strict_routing_tests::abort_cancels_an_already_drained_flush_blocked_on_channel_capacity"
+    }
+  ],
+  "commands_prepared_not_executed": [
+    {
+      "selection": "state queue",
+      "expected_source_count": 11,
+      "discovery": "cargo nextest list -p codex-state -E 'test(/^runtime::queued_items::tests::/)' --message-format json",
+      "execution": "just test -p codex-state -E 'test(/^runtime::queued_items::tests::/)'"
+    },
+    {
+      "selection": "queue extension integration",
+      "expected_source_count": 18,
+      "discovery": "cargo nextest list -p codex-queue-extension --test queue_service --message-format json",
+      "execution": "just test -p codex-queue-extension --test queue_service"
+    },
+    {
+      "selection": "Core voice and realtime conversation",
+      "expected_source_count": 29,
+      "discovery": "cargo nextest list -p codex-core --lib -E 'test(/^realtime_voice_/) | test(/^realtime_conversation::/)' --message-format json",
+      "execution": "just test -p codex-core --lib -E 'test(/^realtime_voice_/) | test(/^realtime_conversation::/)'"
+    }
+  ],
+  "directly_affected_regressions_pending_full_checkout": [
+    {
+      "crate": "codex-core",
+      "module": "session::turn_input::tests",
+      "source_file": "codex-rs/core/src/session/turn_input_tests.rs",
+      "status": "NC_FULL_CHECKOUT_REQUIRED",
+      "reason": "The selective source references this test file, but does not contain it. start_if_idle was changed. Enumerate concrete test names after full checkout.",
+      "discovery": "cargo nextest list -p codex-core --lib -E 'test(/^session::turn_input::tests::/)' --message-format json",
+      "execution": "just test -p codex-core --lib -E 'test(/^session::turn_input::tests::/)'"
+    },
+    {
+      "crate": "codex-core",
+      "module": "session::tests",
+      "status": "NC_FULL_CHECKOUT_REQUIRED",
+      "reason": "Select directly affected terminal/abort/send_event regressions only after inspecting full module; this inventory has not asserted exact test names or counts."
+    }
+  ],
+  "mechanical_requirements": [
+    "Use exact Rust 1.95.0 with clippy, rustfmt and rust-src from rust-toolchain.toml.",
+    "Repository AGENTS requires just test; it invokes cargo nextest run --no-fail-fast with NEXTEST_PROFILE=local and RUST_MIN_STACK=8388608.",
+    "codex-queue-extension has lib.test=false: use integration binary queue_service, not a lib-only invocation.",
+    "A realtime_voice-only filter omits every manager test: manager lives under realtime_conversation::strict_routing_tests.",
+    "Use actual nextest list results to verify all expected names present and nonzero; capture execution outcomes, ignored/skipped and failures, not just process rc.",
+    "Do not count repeated test executions as additional distinct discovered tests. Record retries separately.",
+    "just fmt invokes scripts/format.py and formats beyond Rust; full checkout and required helpers needed.",
+    "Include codex-app-server, codex-thread-store and codex-extension-api in check/clippy for changed production linkage; no new adapter test is claimed here."
+  ],
+  "sandbox_and_early_return_caveats": [
+    "Queue integration test uses a local mock SSE listener. If socket creation/bind is denied, report an environment failure; do not treat a skipped path as proof.",
+    "Some upstream tests may early-return under sandbox/network guards. Runner PASS alone does not prove substantive assertions were reached; inspect such guards in selected full-source regressions.",
+    "Do not edit or disable CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR or CODEX_SANDBOX_ENV_VAR guards to manufacture a pass.",
+    "Use temporary test/cache directories explicitly inside the authorized isolated workspace; /tmp is denied. This inventory creates no directories and runs no tests.",
+    "The six abort test functions include one completion control. Some functions loop over cases; source scenarios/loop iterations are not distinct Rust test functions."
+  ]
+}

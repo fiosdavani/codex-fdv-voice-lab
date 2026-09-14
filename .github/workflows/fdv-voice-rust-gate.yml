@@ -1,0 +1,82 @@
+name: FDV isolated Voice Rust gate
+
+on:
+  push:
+    branches: [fdv/rust-gate-20260914-01]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fdv-isolated-rust-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  rust-gate:
+    if: github.repository == 'fiosdavani/codex-fdv-voice-lab' && github.ref == 'refs/heads/fdv/rust-gate-20260914-01'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      RUST_BACKTRACE: '1'
+      RUST_MIN_STACK: '8388608'
+      RUSTUP_HOME: ${{ runner.temp }}/fdv-rustup
+      CARGO_HOME: ${{ runner.temp }}/fdv-cargo
+      TMPDIR: ${{ runner.temp }}/fdv-tmp
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          fetch-depth: 8
+          persist-credentials: false
+      - name: Prepare isolated paths and verify complete patch chain
+        id: chain
+        shell: bash
+        run: |
+          mkdir -p "$TMPDIR" "$RUNNER_TEMP/fdv-receipts"
+          test "$(id -u)" != 0
+          python3 -B fdv-ci/verify_chain.py --repo "$GITHUB_WORKSPACE" --out "$RUNNER_TEMP/fdv-receipts" --worktree "$RUNNER_TEMP/fdv-chain-check"
+      - name: Exact private Rust toolchain
+        id: toolchain
+        uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582
+        with:
+          toolchain: '1.95.0'
+          components: rustfmt, clippy, rust-src
+      - name: Private native headers and pinned test tools
+        id: tools
+        shell: bash
+        run: |
+          python3 -B fdv-ci/provision_runner.py
+          cargo install --locked --root "$RUNNER_TEMP/fdv-tools" --version 1.51.0 just
+          cargo install --locked --root "$RUNNER_TEMP/fdv-tools" --version 0.9.103 cargo-nextest
+          echo "$RUNNER_TEMP/fdv-tools/bin" >> "$GITHUB_PATH"
+      - name: Validate receipt parser controls
+        shell: bash
+        working-directory: fdv-ci
+        run: python3 -B -m unittest -v test_run_gate
+      - name: Rust mechanical gate
+        id: gate
+        continue-on-error: true
+        shell: bash
+        run: python3 -B fdv-ci/run_gate.py --repo "$GITHUB_WORKSPACE" --out "$RUNNER_TEMP/fdv-receipts" --chain-receipt "$RUNNER_TEMP/fdv-receipts/PATCH-CHAIN-RECEIPT.json"
+      - name: Emit exact counts and enforce gate result
+        if: always()
+        env:
+          CHAIN_OUTCOME: ${{ steps.chain.outcome }}
+          TOOLCHAIN_OUTCOME: ${{ steps.toolchain.outcome }}
+          TOOLS_OUTCOME: ${{ steps.tools.outcome }}
+          GATE_OUTCOME: ${{ steps.gate.outcome }}
+        shell: bash
+        run: python3 -B fdv-ci/emit_receipt.py
+      - name: Preserve raw receipts and corrective delta
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+        with:
+          name: fdv-rust-gate-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/fdv-receipts/
+          if-no-files-found: error
+          retention-days: 14

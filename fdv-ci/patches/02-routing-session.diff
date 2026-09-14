@@ -1,0 +1,2820 @@
+diff --git a/codex-rs/app-server/src/voice_admission.rs b/codex-rs/app-server/src/voice_admission.rs
+index 5d7e4fa09c425d40b172c0e881c11ce579eefd6b..290bc5c553a44534497bdac719bf848e32db5399 100644
+--- a/codex-rs/app-server/src/voice_admission.rs
++++ b/codex-rs/app-server/src/voice_admission.rs
+@@ -26,6 +26,7 @@ impl VoiceAdmission for QueueVoiceAdmission {
+                     client_id: Some(input.origin_id.clone()),
+                 },
+                 VoiceQueueOrigin {
++                    native_session_id: input.scope.native_session_id,
+                     voice_session_generation: input.scope.voice_session_generation,
+                     origin_id: input.origin_id,
+                     handoff_id: input.handoff_id,
+diff --git a/codex-rs/core/src/lib.rs b/codex-rs/core/src/lib.rs
+index cdc1f5752a47e9d01cc887ad650b0a5b0116ad3d..ac23001875161bf39ba3551fc86b43d2af4cf8a3 100644
+--- a/codex-rs/core/src/lib.rs
++++ b/codex-rs/core/src/lib.rs
+@@ -12,6 +12,7 @@ mod client_common;
+ mod realtime_context;
+ mod realtime_conversation;
+ mod realtime_voice_admission;
++mod realtime_voice_routing;
+ mod realtime_history;
+ mod realtime_prompt;
+ mod responses_metadata;
+diff --git a/codex-rs/core/src/realtime_conversation.rs b/codex-rs/core/src/realtime_conversation.rs
+index c1cb06a46a1c7247c98dd18ad0752f6bc1728b18..31b56f07efbfb36d4cb5308475c96429f61b9279 100644
+--- a/codex-rs/core/src/realtime_conversation.rs
++++ b/codex-rs/core/src/realtime_conversation.rs
+@@ -7,6 +7,8 @@ use crate::realtime_context::build_realtime_startup_context;
+ use crate::realtime_context::truncate_realtime_text_to_token_budget;
+ use crate::realtime_prompt::prepare_realtime_backend_prompt;
+ use crate::realtime_voice_admission::voice_admission_input;
++use crate::realtime_voice_routing::VoiceTurnRoutes;
++use codex_extension_api::VoiceAdmissionInput;
+ use crate::responses_metadata::THREAD_SOURCE_KEY;
+ use crate::session::session::Session;
+ use anyhow::Context;
+@@ -177,6 +179,8 @@ impl RealtimeHandoffAdmission {
+         let admission = session.services.extensions.voice_admission()
+             .ok_or("Durable Voice admission is unavailable; no start-or-steer fallback")?;
+         let input = voice_admission_input(session.thread_id(), scope, handoff, text)?;
++        // Register before enqueue: an idle queue can start before admit returns.
++        session.conversation.remember_voice_origin(&input).await?;
+         admission.admit(input).await
+             .map_err(|_| "Durable Voice admission failed; no automatic retry")?;
+         Ok(())
+@@ -203,7 +207,8 @@ enum RealtimeSessionKind {
+ #[derive(Clone, Debug)]
+ struct RealtimeHandoffState {
+     output_tx: Sender<RealtimeOutbound>,
+-    last_output: Arc<Mutex<Option<RealtimeHandoffOutput>>>,
++    last_output: Arc<Mutex<HashMap<String, RealtimeHandoffOutput>>>,
++    voice_routes: Option<Arc<Mutex<VoiceTurnRoutes>>>,
+     stream: Arc<Mutex<RealtimeHandoffStreamState>>,
+     client_managed_handoffs: bool,
+     codex_responses_as_items: bool,
+@@ -228,6 +233,7 @@ struct RealtimeHandoffStreamState {
+ 
+ #[derive(Debug)]
+ struct RealtimeStreamedItem {
++    turn_id: String,
+     handoff_id: String,
+     phase: Option<MessagePhase>,
+     bem_channel_parser: Option<BemChannelParser>,
+@@ -499,7 +505,58 @@ struct RealtimeInputChannels {
+     audio_rx: Receiver<RealtimeAudioFrame>,
+ }
+ 
++#[derive(Debug, PartialEq, Eq)]
++enum HandoffArrivalEffect {
++    Queued,
++    Activated,
++    SteerAcknowledgement,
++}
++
++#[derive(Clone, Copy)]
++enum V2HandoffStage { Progress, Final }
++
+ impl RealtimeHandoffState {
++    async fn v2_handoff_payload(
++        &self, handoff_id: &str, stage: V2HandoffStage, text: String,
++    ) -> Option<String> {
++        if let Some(routes) = &self.voice_routes {
++            return match stage {
++                // V2 progress is an unkeyed conversation item. Strict routing
++                // only emits the final function_call_output with exact call ID.
++                V2HandoffStage::Progress => None,
++                V2HandoffStage::Final => routes.lock().await.was_started(handoff_id).then_some(text),
++            };
++        }
++        match stage {
++            V2HandoffStage::Progress => (
++                self.stream.lock().await.active_handoff.as_deref() == Some(handoff_id)
++            ).then_some(text),
++            V2HandoffStage::Final => Some(REALTIME_V2_HANDOFF_COMPLETE_ACKNOWLEDGEMENT.to_string()),
++        }
++    }
++
++    async fn receive_handoff(&self, handoff: &RealtimeHandoffRequested) -> HandoffArrivalEffect {
++        if self.voice_routes.is_some() {
++            // Strict ingress may enqueue, never mutate routing or acknowledge steer.
++            return HandoffArrivalEffect::Queued;
++        }
++        let mut stream = self.stream.lock().await;
++        match self.session_kind {
++            RealtimeSessionKind::V1 => {
++                stream.items.clear();
++                stream.active_handoff = Some(handoff.handoff_id.clone());
++                HandoffArrivalEffect::Activated
++            }
++            RealtimeSessionKind::V2 if stream.active_handoff.is_some() => {
++                HandoffArrivalEffect::SteerAcknowledgement
++            }
++            RealtimeSessionKind::V2 => {
++                stream.active_handoff = Some(handoff.handoff_id.clone());
++                HandoffArrivalEffect::Activated
++            }
++        }
++    }
++
+     fn streams_handoff_append(&self) -> bool {
+         self.event_parser == RealtimeEventParser::FramelessBidi
+             && !self.client_managed_handoffs
+@@ -527,6 +584,7 @@ struct ConversationState {
+ }
+ 
+ struct RealtimeStart {
++    voice_scope: Option<VoiceAdmissionScope>,
+     api_provider: ApiProvider,
+     realtime_sideband_base_url: Option<String>,
+     extra_headers: Option<HeaderMap>,
+@@ -620,6 +678,7 @@ impl RealtimeConversationManager {
+ 
+     async fn start_inner(&self, start: RealtimeStart) -> CodexResult<RealtimeStartOutput> {
+         let RealtimeStart {
++            voice_scope,
+             api_provider,
+             realtime_sideband_base_url,
+             extra_headers,
+@@ -656,7 +715,8 @@ impl RealtimeConversationManager {
+         let stop_token = CancellationToken::new();
+         let handoff = RealtimeHandoffState {
+             output_tx: handoff_output_tx,
+-            last_output: Arc::new(Mutex::new(None)),
++            last_output: Arc::new(Mutex::new(HashMap::new())),
++            voice_routes: voice_scope.map(|scope| Arc::new(Mutex::new(VoiceTurnRoutes::new(scope)))),
+             stream: Arc::new(Mutex::new(RealtimeHandoffStreamState::default())),
+             client_managed_handoffs,
+             codex_responses_as_items,
+@@ -858,8 +918,28 @@ impl RealtimeConversationManager {
+         Ok(())
+     }
+ 
++    async fn remember_voice_origin(&self, input: &VoiceAdmissionInput) -> Result<(), &'static str> {
++        let routes = self.state.lock().await.as_ref()
++            .and_then(|state| state.handoff.voice_routes.clone())
++            .ok_or("Strict Voice session routing is unavailable")?;
++        let result = routes.lock().await.received(input);
++        result
++    }
++
++    pub(crate) async fn activate_voice_turn(
++        &self, turn_id: &str, client_id: Option<&str>,
++    ) -> Result<(), &'static str> {
++        let routes = self.state.lock().await.as_ref()
++            .and_then(|state| state.handoff.voice_routes.clone());
++        if let Some(routes) = routes {
++            routes.lock().await.started(turn_id, client_id)?;
++        }
++        Ok(())
++    }
++
+     pub(crate) async fn handoff_out(
+         &self,
++        turn_id: &str,
+         output_text: String,
+         phase: Option<MessagePhase>,
+     ) -> CodexResult<()> {
+@@ -891,11 +971,18 @@ impl RealtimeConversationManager {
+             phase
+         };
+         let is_commentary = matches!(phase, Some(MessagePhase::Commentary));
+-        let active_handoff = handoff.stream.lock().await.active_handoff.clone();
++        let active_handoff = if let Some(routes) = &handoff.voice_routes {
++            let route = routes.lock().await.binding(turn_id).cloned();
++            // Strict mode never falls back to an anonymous/standalone handoff.
++            let Some(route) = route else { return Ok(()); };
++            Some(route.handoff_id)
++        } else {
++            handoff.stream.lock().await.active_handoff.clone()
++        };
+         let output = match active_handoff {
+             Some(handoff_id) => {
+                 let output_text = realtime_backend_output(output_text, handoff.session_kind);
+-                *handoff.last_output.lock().await = Some(RealtimeHandoffOutput {
++                handoff.last_output.lock().await.insert(turn_id.to_string(), RealtimeHandoffOutput {
+                     text: output_text.clone(),
+                     phase: phase.clone(),
+                 });
+@@ -954,6 +1041,7 @@ impl RealtimeConversationManager {
+ 
+     pub(crate) async fn register_handoff_stream_item(
+         &self,
++        turn_id: &str,
+         item_id: String,
+         phase: Option<MessagePhase>,
+         initial_text: String,
+@@ -968,12 +1056,19 @@ impl RealtimeConversationManager {
+         if !handoff.streams_handoff_append() {
+             return;
+         }
++        let handoff_id = if let Some(routes) = &handoff.voice_routes {
++            routes.lock().await.binding(turn_id).map(|route| route.handoff_id.clone())
++        } else {
++            handoff.stream.lock().await.active_handoff.clone()
++        };
++        let Some(handoff_id) = handoff_id else { return; };
+         let flush_delay = {
+             let mut stream = handoff.stream.lock().await;
+-            let Some(handoff_id) = stream.active_handoff.clone() else {
++            if stream.items.get(&item_id).is_some_and(|item| item.turn_id != turn_id) {
+                 return;
+-            };
++            }
+             let mut streamed_item = RealtimeStreamedItem {
++                turn_id: turn_id.to_string(),
+                 handoff_id,
+                 phase: if handoff.routes_handoff_by_bem() {
+                     None
+@@ -1004,12 +1099,13 @@ impl RealtimeConversationManager {
+             flush_delay
+         };
+         if let Some(flush_delay) = flush_delay {
+-            schedule_streamed_handoff_flush(&handoff, item_id, flush_delay);
++            schedule_streamed_handoff_flush(&handoff, turn_id.to_string(), item_id, flush_delay);
+         }
+     }
+ 
+     pub(crate) async fn stream_handoff_delta(
+         &self,
++        turn_id: &str,
+         item_id: &str,
+         delta: String,
+     ) -> CodexResult<()> {
+@@ -1033,6 +1129,7 @@ impl RealtimeConversationManager {
+             let Some(streamed_item) = stream.items.get_mut(item_id) else {
+                 return Ok(());
+             };
++            if streamed_item.turn_id != turn_id { return Ok(()); }
+             streamed_item.push_text(&delta);
+             if streamed_item.flush_scheduled || streamed_item.streamable_text_bytes() == 0 {
+                 None
+@@ -1042,12 +1139,12 @@ impl RealtimeConversationManager {
+             }
+         };
+         if let Some(flush_delay) = flush_delay {
+-            schedule_streamed_handoff_flush(&handoff, item_id.to_string(), flush_delay);
++            schedule_streamed_handoff_flush(&handoff, turn_id.to_string(), item_id.to_string(), flush_delay);
+         }
+         Ok(())
+     }
+ 
+-    pub(crate) async fn finish_handoff_stream_item(&self, item_id: &str) -> bool {
++    pub(crate) async fn finish_handoff_stream_item(&self, turn_id: &str, item_id: &str) -> bool {
+         let handoff = {
+             let guard = self.state.lock().await;
+             guard.as_ref().map(|state| state.handoff.clone())
+@@ -1058,9 +1155,14 @@ impl RealtimeConversationManager {
+         if !handoff.streams_handoff_append() {
+             return false;
+         }
+-        let Some(mut streamed_item) = handoff.stream.lock().await.items.remove(item_id) else {
+-            return false;
++        let streamed_item = {
++            let mut stream = handoff.stream.lock().await;
++            if stream.items.get(item_id).is_none_or(|item| item.turn_id != turn_id) {
++                return false;
++            }
++            stream.items.remove(item_id)
+         };
++        let Some(mut streamed_item) = streamed_item else { return false; };
+         streamed_item.finish_input();
+         let chunk = streamed_item.drain_final_chunk();
+         let sent_output = streamed_item.sent_bytes > 0;
+@@ -1092,6 +1194,9 @@ impl RealtimeConversationManager {
+             state.handoff.clone()
+         };
+ 
++        if handoff.voice_routes.is_some() {
++            return Err(CodexErr::InvalidRequest("Strict Voice speech requires a bound turn".to_string()));
++        }
+         handoff
+             .output_tx
+             .send(RealtimeOutbound::StandaloneSpeech {
+@@ -1102,7 +1207,7 @@ impl RealtimeConversationManager {
+         Ok(())
+     }
+ 
+-    pub(crate) async fn handoff_complete(&self) -> CodexResult<()> {
++    pub(crate) async fn handoff_complete(&self, turn_id: &str) -> CodexResult<()> {
+         let handoff = {
+             let guard = self.state.lock().await;
+             guard.as_ref().map(|state| state.handoff.clone())
+@@ -1118,10 +1223,13 @@ impl RealtimeConversationManager {
+             RealtimeSessionKind::V2 => {}
+         }
+ 
+-        let Some(handoff_id) = handoff.stream.lock().await.active_handoff.clone() else {
+-            return Ok(());
++        let handoff_id = if let Some(routes) = &handoff.voice_routes {
++            routes.lock().await.binding(turn_id).map(|route| route.handoff_id.clone())
++        } else {
++            handoff.stream.lock().await.active_handoff.clone()
+         };
+-        let Some(last_output) = handoff.last_output.lock().await.clone() else {
++        let Some(handoff_id) = handoff_id else { return Ok(()); };
++        let Some(last_output) = handoff.last_output.lock().await.get(turn_id).cloned() else {
+             return Ok(());
+         };
+ 
+@@ -1142,18 +1250,21 @@ impl RealtimeConversationManager {
+             .map_err(|_| CodexErr::InvalidRequest("conversation is not running".to_string()))
+     }
+ 
+-    pub(crate) async fn clear_active_handoff(&self) {
++    pub(crate) async fn clear_active_handoff(&self, turn_id: &str) {
+         let handoff = {
+             let guard = self.state.lock().await;
+             guard.as_ref().map(|state| state.handoff.clone())
+         };
+         if let Some(handoff) = handoff {
+-            {
++            if let Some(routes) = &handoff.voice_routes {
++                routes.lock().await.complete(turn_id);
++                handoff.stream.lock().await.items.retain(|_, item| item.turn_id != turn_id);
++            } else {
+                 let mut stream = handoff.stream.lock().await;
+                 stream.active_handoff = None;
+                 stream.items.clear();
+             }
+-            *handoff.last_output.lock().await = None;
++            handoff.last_output.lock().await.remove(turn_id);
+         }
+     }
+ 
+@@ -1604,11 +1715,14 @@ async fn handle_start_inner(
+         session_config,
+         transport,
+     } = prepared_start;
+-    let voice_scope = sess.services.thread_extension_data.get::<VoiceAdmissionScope>();
++    let voice_scope = sess.services.thread_extension_data.get::<VoiceAdmissionScope>()
++        .map(|scope| (*scope).clone());
+     if let Some(scope) = &voice_scope
+         && (scope.voice_session_generation == 0
+             || scope.voice_session_generation > i64::MAX as u64
+             || scope.native_session_id.is_empty()
++            || client_managed_handoffs
++            || codex_responses_as_items
+             || requested_realtime_session_id.as_deref() != Some(scope.native_session_id.as_str())
+             || sess.services.extensions.voice_admission().is_none())
+     {
+@@ -1627,6 +1741,7 @@ async fn handle_start_inner(
+         end: realtime_end_instructions,
+     };
+     let start = RealtimeStart {
++        voice_scope: voice_scope.clone(),
+         api_provider,
+         realtime_sideband_base_url,
+         extra_headers,
+@@ -2154,12 +2269,13 @@ async fn handle_text_input(
+     Ok(())
+ }
+ 
+-async fn flush_streamed_handoff_item(handoff: &RealtimeHandoffState, item_id: &str) {
++async fn flush_streamed_handoff_item(handoff: &RealtimeHandoffState, turn_id: &str, item_id: &str) {
+     let (handoff_id, text, phase) = {
+         let mut stream = handoff.stream.lock().await;
+         let Some(streamed_item) = stream.items.get_mut(item_id) else {
+             return;
+         };
++        if streamed_item.turn_id != turn_id { return; }
+         streamed_item.flush_scheduled = false;
+         let Some(text) = streamed_item.drain_stream_chunk() else {
+             return;
+@@ -2183,13 +2299,14 @@ async fn flush_streamed_handoff_item(handoff: &RealtimeHandoffState, item_id: &s
+ 
+ fn schedule_streamed_handoff_flush(
+     handoff: &RealtimeHandoffState,
++    turn_id: String,
+     item_id: String,
+     flush_delay: Duration,
+ ) {
+     let handoff = handoff.clone();
+     let _flush_task = tokio::spawn(async move {
+         tokio::time::sleep(flush_delay).await;
+-        flush_streamed_handoff_item(&handoff, &item_id).await;
++        flush_streamed_handoff_item(&handoff, &turn_id, &item_id).await;
+     });
+ }
+ 
+@@ -2365,27 +2482,25 @@ async fn handle_handoff_output(
+                 text,
+                 phase: _,
+             } => {
+-                let active_handoff = handoff_state.stream.lock().await.active_handoff.clone();
+-                match active_handoff {
+-                    Some(active_handoff) if active_handoff == handoff_id => {}
+-                    Some(_) | None => {
+-                        debug!("dropping stale realtime handoff progress update");
+-                        return Ok(());
+-                    }
+-                }
++                let Some(text) = handoff_state.v2_handoff_payload(
++                    &handoff_id, V2HandoffStage::Progress, text,
++                ).await else { return Ok(()); };
+                 writer
+                     .send_conversation_item_create(text, ConversationTextRole::User)
+                     .await
+             }
+             RealtimeOutbound::CompletedHandoff {
+                 handoff_id,
+-                text: _,
++                text,
+                 phase: _,
+             } => {
++                let Some(text) = handoff_state.v2_handoff_payload(
++                    &handoff_id, V2HandoffStage::Final, text,
++                ).await else { return Ok(()); };
+                 if let Err(err) = writer
+                     .send_conversation_function_call_output(
+                         handoff_id,
+-                        REALTIME_V2_HANDOFF_COMPLETE_ACKNOWLEDGEMENT.to_string(),
++                        text,
+                     )
+                     .await
+                 {
+@@ -2493,37 +2608,16 @@ async fn handle_realtime_server_event(
+             false
+         }
+         RealtimeEvent::HandoffRequested(handoff) => {
+-            *output_audio_state = None;
+-
+-            match session_kind {
+-                RealtimeSessionKind::V1 => {
+-                    let mut stream = handoff_state.stream.lock().await;
+-                    stream.items.clear();
+-                    stream.active_handoff = Some(handoff.handoff_id.clone());
+-                }
+-                RealtimeSessionKind::V2 => {
+-                    let active_handoff = handoff_state.stream.lock().await.active_handoff.clone();
+-                    match active_handoff {
+-                        Some(_) => {
+-                            if let Err(err) = writer
+-                                .send_conversation_function_call_output(
+-                                    handoff.handoff_id.clone(),
+-                                    REALTIME_V2_STEER_ACKNOWLEDGEMENT.to_string(),
+-                                )
+-                                .await
+-                            {
+-                                warn!("failed to send handoff steering acknowledgement: {err}");
+-                                return Err(err.into());
+-                            }
+-                            response_create_queue
+-                                .request_create(writer, "handoff steering")
+-                                .await?;
+-                        }
+-                        None => {
+-                            handoff_state.stream.lock().await.active_handoff =
+-                                Some(handoff.handoff_id.clone());
+-                        }
+-                    }
++            match handoff_state.receive_handoff(handoff).await {
++                HandoffArrivalEffect::Queued => {}
++                HandoffArrivalEffect::Activated => { *output_audio_state = None; }
++                HandoffArrivalEffect::SteerAcknowledgement => {
++                    *output_audio_state = None;
++                    writer.send_conversation_function_call_output(
++                        handoff.handoff_id.clone(),
++                        REALTIME_V2_STEER_ACKNOWLEDGEMENT.to_string(),
++                    ).await.map_err(anyhow::Error::from)?;
++                    response_create_queue.request_create(writer, "handoff steering").await?;
+                 }
+             }
+             false
+@@ -2676,3 +2770,7 @@ async fn send_realtime_conversation_closed(
+ #[cfg(test)]
+ #[path = "realtime_conversation_tests.rs"]
+ mod tests;
++
++#[cfg(test)]
++#[path = "realtime_voice_manager_tests.rs"]
++mod strict_routing_tests;
+diff --git a/codex-rs/core/src/realtime_conversation_tests.rs b/codex-rs/core/src/realtime_conversation_tests.rs
+index 70075592d166335a7d12c043f12856417b606400..f0d0b8f33778a231d915fc1b2892521a32325c83 100644
+--- a/codex-rs/core/src/realtime_conversation_tests.rs
++++ b/codex-rs/core/src/realtime_conversation_tests.rs
+@@ -209,7 +209,8 @@ async fn clears_active_handoff_explicitly() {
+     let (tx, _rx) = bounded(1);
+     let state = RealtimeHandoffState {
+         output_tx: tx,
+-        last_output: Arc::new(Mutex::new(None)),
++        last_output: Arc::new(Mutex::new(std::collections::HashMap::new())),
++        voice_routes: None,
+         stream: Arc::new(Mutex::new(Default::default())),
+         client_managed_handoffs: false,
+         codex_responses_as_items: false,
+@@ -233,6 +234,7 @@ async fn clears_active_handoff_explicitly() {
+ #[test]
+ fn streamed_handoff_preserves_a_bounded_final_tail() {
+     let mut item = RealtimeStreamedItem {
++        turn_id: "test-turn".to_string(),
+         handoff_id: "handoff_1".to_string(),
+         phase: Some(MessagePhase::FinalAnswer),
+         bem_channel_parser: None,
+@@ -263,6 +265,7 @@ fn streamed_handoff_preserves_a_bounded_final_tail() {
+ #[test]
+ fn streamed_v3_handoff_omits_the_final_message_prefix() {
+     let mut item = RealtimeStreamedItem {
++        turn_id: "test-turn".to_string(),
+         handoff_id: "handoff_1".to_string(),
+         phase: Some(MessagePhase::FinalAnswer),
+         bem_channel_parser: None,
+diff --git a/codex-rs/core/src/realtime_voice_manager_tests.rs b/codex-rs/core/src/realtime_voice_manager_tests.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..fdd7a98843c274316554c2067d97430abc22fbfb
+--- /dev/null
++++ b/codex-rs/core/src/realtime_voice_manager_tests.rs
+@@ -0,0 +1,151 @@
++//! The actual manager/output channel is exercised here. No realtime transport,
++//! model, queue double, Windows process or native audio is started by these tests.
++
++use super::*;
++use codex_protocol::ThreadId;
++use pretty_assertions::assert_eq;
++
++fn handoff(id: &str) -> RealtimeHandoffRequested {
++    RealtimeHandoffRequested {
++        handoff_id: id.to_string(), item_id: format!("item-{id}"),
++        input_transcript: "same words".into(), active_transcript: Vec::new(),
++    }
++}
++
++async fn manager(
++    parser: RealtimeEventParser,
++) -> (RealtimeConversationManager, RealtimeHandoffState, Receiver<RealtimeOutbound>, VoiceAdmissionScope) {
++    let scope = VoiceAdmissionScope { native_session_id: "native-A".into(), voice_session_generation: 1 };
++    let session_kind = match parser {
++        RealtimeEventParser::V1 | RealtimeEventParser::FramelessBidi => RealtimeSessionKind::V1,
++        RealtimeEventParser::RealtimeV2 => RealtimeSessionKind::V2,
++    };
++    let (output_tx, output_rx) = async_channel::bounded(16);
++    let handoff = RealtimeHandoffState {
++        output_tx, last_output: Arc::new(Mutex::new(HashMap::new())),
++        voice_routes: Some(Arc::new(Mutex::new(VoiceTurnRoutes::new(scope.clone())))),
++        stream: Arc::new(Mutex::new(RealtimeHandoffStreamState::default())),
++        client_managed_handoffs: false, codex_responses_as_items: false,
++        codex_response_item_prefix: None,
++        codex_response_handoff_mode: CodexResponseHandoffMode::Thinking,
++        codex_response_handoff_channel_prefixes: Arc::new(BTreeMap::new()),
++        session_kind, event_parser: parser,
++    };
++    let (audio_tx, _) = async_channel::bounded(1);
++    let (text_tx, _) = async_channel::bounded(1);
++    let manager = RealtimeConversationManager {
++        state: Mutex::new(Some(ConversationState {
++            audio_tx, text_tx, session_kind, handoff: handoff.clone(),
++            input_task: tokio::spawn(async {}), fanout_task: None,
++            realtime_active: Arc::new(AtomicBool::new(true)),
++            route_handoffs: Arc::new(RealtimeHandoffAdmission::new()),
++            stop_token: CancellationToken::new(),
++        })),
++        mode_instructions: Mutex::new(None),
++    };
++    (manager, handoff, output_rx, scope)
++}
++
++#[tokio::test]
++async fn strict_v1_v2_frameless_arrival_never_rebinds_or_acknowledges_steer() {
++    for parser in [RealtimeEventParser::V1, RealtimeEventParser::RealtimeV2, RealtimeEventParser::FramelessBidi] {
++        let (manager, state, output, scope) = manager(parser).await;
++        let a = voice_admission_input(ThreadId::new(), &scope, &handoff("A"), "same words".into()).unwrap();
++        let b = voice_admission_input(a.thread_id, &scope, &handoff("B"), "same words".into()).unwrap();
++        manager.remember_voice_origin(&a).await.unwrap();
++        manager.activate_voice_turn("turn-A", Some(&a.origin_id)).await.unwrap();
++        // This is the actual arrival decision consumed by handle_realtime_server_event.
++        // Its SteerAcknowledgement effect is the only branch that writes a steer ACK.
++        assert_eq!(state.receive_handoff(&handoff("B")).await, HandoffArrivalEffect::Queued);
++        manager.remember_voice_origin(&b).await.unwrap();
++        manager.remember_voice_origin(&b).await.unwrap();
++        assert!(!state.voice_routes.as_ref().unwrap().lock().await.was_started("B"));
++        if parser == RealtimeEventParser::RealtimeV2 {
++            assert_eq!(state.v2_handoff_payload("A", V2HandoffStage::Progress, "A progress".into()).await, None);
++            assert_eq!(state.v2_handoff_payload("B", V2HandoffStage::Final, "not started B".into()).await, None);
++            assert_eq!(state.v2_handoff_payload("A", V2HandoffStage::Final, "A final".into()).await, Some("A final".into()));
++        }
++        assert_eq!(state.stream.lock().await.active_handoff, None);
++        assert!(output.is_empty());
++        manager.handoff_out("turn-A", "output A".into(), None).await.unwrap();
++        assert_eq!(output.recv().await.unwrap(), RealtimeOutbound::HandoffUpdate {
++            handoff_id: "A".into(), text: realtime_backend_output("output A".into(), state.session_kind), phase: None,
++        });
++        manager.handoff_out("turn-B", "must remain held".into(), None).await.unwrap();
++        assert!(output.is_empty());
++        manager.handoff_complete("turn-A").await.unwrap();
++        if parser == RealtimeEventParser::RealtimeV2 {
++            assert_eq!(output.recv().await.unwrap(), RealtimeOutbound::CompletedHandoff {
++                handoff_id: "A".into(), text: realtime_backend_output("output A".into(), state.session_kind), phase: None,
++            });
++        }
++        manager.clear_active_handoff("turn-A").await;
++        manager.activate_voice_turn("turn-B", Some(&b.origin_id)).await.unwrap();
++        assert!(state.voice_routes.as_ref().unwrap().lock().await.was_started("B"));
++        // Late completion A cannot clear B, its first item, or B's last output.
++        manager.handoff_out("turn-B", "output B".into(), None).await.unwrap();
++        manager.clear_active_handoff("turn-A").await;
++        assert_eq!(output.recv().await.unwrap(), RealtimeOutbound::HandoffUpdate {
++            handoff_id: "B".into(), text: realtime_backend_output("output B".into(), state.session_kind), phase: None,
++        });
++        manager.handoff_out("turn-B", "B still alive".into(), None).await.unwrap();
++        assert!(matches!(output.recv().await.unwrap(), RealtimeOutbound::HandoffUpdate { handoff_id, .. } if handoff_id == "B"));
++        manager.shutdown().await.unwrap();
++    }
++}
++
++#[tokio::test]
++async fn v2_terminal_event_arrives_after_successor_start_and_keeps_each_last_output() {
++    let (manager, state, output, scope) = manager(RealtimeEventParser::RealtimeV2).await;
++    let a = voice_admission_input(ThreadId::new(), &scope, &handoff("A"), "A".into()).unwrap();
++    let b = voice_admission_input(a.thread_id, &scope, &handoff("B"), "B".into()).unwrap();
++    manager.remember_voice_origin(&a).await.unwrap();
++    manager.activate_voice_turn("turn-A", Some(&a.origin_id)).await.unwrap();
++    manager.handoff_out("turn-A", "final A".into(), None).await.unwrap();
++    manager.remember_voice_origin(&b).await.unwrap();
++    manager.activate_voice_turn("turn-B", Some(&b.origin_id)).await.unwrap();
++    manager.handoff_out("turn-B", "final B".into(), None).await.unwrap();
++    for (handoff_id, text) in [("A", "final A"), ("B", "final B")] {
++        assert_eq!(output.recv().await.unwrap(), RealtimeOutbound::HandoffUpdate {
++            handoff_id: handoff_id.into(), text: realtime_backend_output(text.into(), state.session_kind), phase: None,
++        });
++    }
++    manager.handoff_complete("turn-A").await.unwrap();
++    manager.clear_active_handoff("turn-A").await;
++    manager.handoff_complete("turn-B").await.unwrap();
++    for (handoff_id, text) in [("A", "final A"), ("B", "final B")] {
++        assert_eq!(output.recv().await.unwrap(), RealtimeOutbound::CompletedHandoff {
++            handoff_id: handoff_id.into(), text: realtime_backend_output(text.into(), state.session_kind), phase: None,
++        });
++    }
++    manager.shutdown().await.unwrap();
++}
++
++#[tokio::test]
++async fn frameless_stream_items_and_delayed_completion_are_turn_bound() {
++    let (manager, state, output, scope) = manager(RealtimeEventParser::FramelessBidi).await;
++    let a = voice_admission_input(ThreadId::new(), &scope, &handoff("A"), "words A".into()).unwrap();
++    let b = voice_admission_input(a.thread_id, &scope, &handoff("B"), "words B".into()).unwrap();
++    manager.remember_voice_origin(&a).await.unwrap();
++    manager.activate_voice_turn("turn-A", Some(&a.origin_id)).await.unwrap();
++    manager.register_handoff_stream_item("turn-A", "item-A".into(), None, String::new()).await;
++    manager.remember_voice_origin(&b).await.unwrap();
++    assert_eq!(state.receive_handoff(&handoff("B")).await, HandoffArrivalEffect::Queued);
++    manager.stream_handoff_delta("turn-A", "item-A", "output A".into()).await.unwrap();
++    manager.stream_handoff_delta("turn-B", "item-A", "must not leak".into()).await.unwrap();
++    assert!(manager.finish_handoff_stream_item("turn-A", "item-A").await);
++    assert_eq!(output.recv().await.unwrap(), RealtimeOutbound::HandoffAppend {
++        handoff_id: "A".into(), text: "output A".into(), phase: None,
++    });
++    manager.activate_voice_turn("turn-B", Some(&b.origin_id)).await.unwrap();
++    manager.register_handoff_stream_item("turn-B", "item-B".into(), None, String::new()).await;
++    manager.clear_active_handoff("turn-A").await;
++    manager.stream_handoff_delta("turn-B", "item-B", "output B".into()).await.unwrap();
++    flush_streamed_handoff_item(&state, "turn-A", "item-B").await;
++    assert!(output.is_empty());
++    assert!(manager.finish_handoff_stream_item("turn-B", "item-B").await);
++    assert_eq!(output.recv().await.unwrap(), RealtimeOutbound::HandoffAppend {
++        handoff_id: "B".into(), text: "output B".into(), phase: None,
++    });
++    manager.shutdown().await.unwrap();
++}
+diff --git a/codex-rs/core/src/realtime_voice_routing.rs b/codex-rs/core/src/realtime_voice_routing.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..04dd5380b5ef4c373d1926b195b98603c640bec8
+--- /dev/null
++++ b/codex-rs/core/src/realtime_voice_routing.rs
+@@ -0,0 +1,118 @@
++//! Session-local routing, deliberately distinct from durable queue admission.
++//!
++//! Receiving an origin records no active handoff. Only Core's accepted StartIfIdle
++//! path binds a turn, before spawning its task. This map is not replay authority.
++
++use std::collections::HashMap;
++
++use codex_extension_api::VoiceAdmissionInput;
++use codex_extension_api::VoiceAdmissionScope;
++
++const MAX_SESSION_ORIGINS: usize = 4096;
++
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub(crate) struct VoiceTurnBinding {
++    pub(crate) native_session_id: String,
++    pub(crate) voice_session_generation: u64,
++    pub(crate) turn_id: String,
++    pub(crate) origin_id: String,
++    pub(crate) client_id: String,
++    pub(crate) handoff_id: String,
++}
++
++#[derive(Debug)]
++struct ReceivedOrigin {
++    handoff_id: String,
++    item_id: Option<String>,
++    turn_id: Option<String>,
++    completed: bool,
++}
++
++#[derive(Debug)]
++pub(crate) struct VoiceTurnRoutes {
++    scope: VoiceAdmissionScope,
++    origins: HashMap<String, ReceivedOrigin>,
++    turns: HashMap<String, VoiceTurnBinding>,
++}
++
++impl VoiceTurnRoutes {
++    pub(crate) fn new(scope: VoiceAdmissionScope) -> Self {
++        Self { scope, origins: HashMap::new(), turns: HashMap::new() }
++    }
++
++    pub(crate) fn received(&mut self, input: &VoiceAdmissionInput) -> Result<(), &'static str> {
++        if input.scope != self.scope {
++            return Err("Voice origin belongs to another native session");
++        }
++        let handoff_id = input.handoff_id.as_deref()
++            .filter(|id| !id.is_empty()).ok_or("Voice handoff identity missing")?;
++        if let Some(existing) = self.origins.get(&input.origin_id) {
++            return if existing.handoff_id == handoff_id && existing.item_id == input.item_id {
++                Ok(())
++            } else {
++                Err("Conflicting Voice origin routing identity")
++            };
++        }
++        if self.origins.len() >= MAX_SESSION_ORIGINS {
++            return Err("Voice routing session capacity reached; no implicit eviction");
++        }
++        self.origins.insert(input.origin_id.clone(), ReceivedOrigin {
++            handoff_id: handoff_id.to_string(), item_id: input.item_id.clone(),
++            turn_id: None, completed: false,
++        });
++        Ok(())
++    }
++
++    /// Called after StartIfIdle reserves and accepts the turn, before task spawn.
++    /// Unknown client IDs are ordinary non-Voice turns: they gain no Voice route.
++    pub(crate) fn started(
++        &mut self, turn_id: &str, client_id: Option<&str>,
++    ) -> Result<(), &'static str> {
++        let Some(client_id) = client_id else { return Ok(()); };
++        let Some(origin) = self.origins.get_mut(client_id) else { return Ok(()); };
++        if turn_id.is_empty() {
++            return Err("Voice turn identity missing");
++        }
++        if let Some(existing) = &origin.turn_id {
++            return if existing == turn_id && !origin.completed {
++                Ok(())
++            } else {
++                Err("Voice origin already bound; no rebind after completion")
++            };
++        }
++        if self.turns.contains_key(turn_id) {
++            return Err("Turn already belongs to another Voice origin");
++        }
++        origin.turn_id = Some(turn_id.to_string());
++        self.turns.insert(turn_id.to_string(), VoiceTurnBinding {
++            native_session_id: self.scope.native_session_id.clone(),
++            voice_session_generation: self.scope.voice_session_generation,
++            turn_id: turn_id.to_string(), origin_id: client_id.to_string(),
++            client_id: client_id.to_string(), handoff_id: origin.handoff_id.clone(),
++        });
++        Ok(())
++    }
++
++    pub(crate) fn binding(&self, turn_id: &str) -> Option<&VoiceTurnBinding> {
++        let binding = self.turns.get(turn_id)?;
++        (!self.origins.get(&binding.origin_id)?.completed).then_some(binding)
++    }
++
++    /// Queued outbound frames carry their handoff identity already. A completed
++    /// origin remains known so its final queued frame can drain after TurnComplete.
++    pub(crate) fn was_started(&self, handoff_id: &str) -> bool {
++        self.turns.values().any(|binding| binding.handoff_id == handoff_id)
++    }
++
++    pub(crate) fn complete(&mut self, turn_id: &str) {
++        if let Some(binding) = self.turns.get(turn_id)
++            && let Some(origin) = self.origins.get_mut(&binding.origin_id)
++        {
++            origin.completed = true;
++        }
++    }
++}
++
++#[cfg(test)]
++#[path = "realtime_voice_routing_tests.rs"]
++mod tests;
+diff --git a/codex-rs/core/src/realtime_voice_routing_tests.rs b/codex-rs/core/src/realtime_voice_routing_tests.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..2986c147253b8f717a426f1fb21acb28c7ce32d2
+--- /dev/null
++++ b/codex-rs/core/src/realtime_voice_routing_tests.rs
+@@ -0,0 +1,52 @@
++use super::*;
++use codex_protocol::ThreadId;
++use pretty_assertions::assert_eq;
++
++fn origin(scope: &VoiceAdmissionScope, id: &str) -> VoiceAdmissionInput {
++    VoiceAdmissionInput {
++        thread_id: ThreadId::new(), scope: scope.clone(), origin_id: id.to_string(),
++        handoff_id: Some(format!("handoff-{id}")), item_id: Some(format!("item-{id}")),
++        text: "same spoken words".to_string(),
++    }
++}
++
++#[test]
++fn received_is_not_started_and_completion_does_not_consume_pending_origin() {
++    let scope = VoiceAdmissionScope { native_session_id: "native-A".into(), voice_session_generation: 1 };
++    let mut routes = VoiceTurnRoutes::new(scope.clone());
++    let a = origin(&scope, "origin-A");
++    let b = origin(&scope, "origin-B");
++    routes.received(&a).unwrap();
++    routes.started("turn-A", Some("origin-A")).unwrap();
++    let binding_a = routes.binding("turn-A").unwrap().clone();
++    routes.received(&b).unwrap();
++    routes.received(&b).unwrap();
++    assert_eq!(routes.binding("turn-A"), Some(&binding_a));
++    assert_eq!(routes.binding("turn-B"), None);
++    routes.complete("turn-A");
++    assert_eq!(routes.binding("turn-A"), None);
++    routes.started("turn-B", Some("origin-B")).unwrap();
++    assert_eq!(routes.binding("turn-B"), Some(&VoiceTurnBinding {
++        native_session_id: "native-A".into(), voice_session_generation: 1,
++        turn_id: "turn-B".into(), origin_id: "origin-B".into(), client_id: "origin-B".into(),
++        handoff_id: "handoff-origin-B".into(),
++    }));
++    routes.complete("turn-A");
++    assert!(routes.binding("turn-B").is_some());
++    assert!(routes.started("another-turn", Some("origin-A")).is_err());
++    assert!(routes.started("another-turn", Some("origin-B")).is_err());
++}
++
++#[test]
++fn mismatched_session_and_unknown_client_id_never_gain_routes() {
++    let scope = VoiceAdmissionScope { native_session_id: "native-A".into(), voice_session_generation: 7 };
++    let mut routes = VoiceTurnRoutes::new(scope.clone());
++    let mut wrong_session = origin(&scope, "origin-A");
++    wrong_session.scope.native_session_id = "native-B".into();
++    assert!(routes.received(&wrong_session).is_err());
++    routes.started("turn-A", Some("origin-A")).unwrap();
++    assert_eq!(routes.binding("turn-A"), None);
++    routes.received(&origin(&scope, "origin-A")).unwrap();
++    routes.started("turn-B", Some("not-the-origin")).unwrap();
++    assert_eq!(routes.binding("turn-B"), None);
++}
+diff --git a/codex-rs/core/src/session/mod.rs b/codex-rs/core/src/session/mod.rs
+index 3e0a931b437e7366d166de26af6b5cf350ddc3e6..1df36e67fda5ff85be9646f7b40d60c014a8ea23 100644
+--- a/codex-rs/core/src/session/mod.rs
++++ b/codex-rs/core/src/session/mod.rs
+@@ -2271,9 +2271,9 @@ impl Session {
+         self.send_event_raw(event).await;
+         self.maybe_notify_parent_of_terminal_turn(turn_context, &legacy_source)
+             .await;
+-        self.maybe_mirror_event_text_to_realtime(&legacy_source)
++        self.maybe_mirror_event_text_to_realtime(&turn_context.sub_id, &legacy_source)
+             .await;
+-        self.maybe_clear_realtime_handoff_for_event(&legacy_source)
++        self.maybe_clear_realtime_handoff_for_event(&turn_context.sub_id, &legacy_source)
+             .await;
+ 
+         let show_raw_agent_reasoning = self.show_raw_agent_reasoning();
+@@ -2452,7 +2452,7 @@ impl Session {
+         }
+     }
+ 
+-    async fn maybe_mirror_event_text_to_realtime(&self, msg: &EventMsg) {
++    async fn maybe_mirror_event_text_to_realtime(&self, turn_id: &str, msg: &EventMsg) {
+         if self.conversation.running_state().await.is_none() {
+             return;
+         }
+@@ -2461,6 +2461,7 @@ impl Session {
+                 if let TurnItem::AgentMessage(item) = &event.item {
+                     self.conversation
+                         .register_handoff_stream_item(
++                            turn_id,
+                             item.id.clone(),
+                             item.phase.clone(),
+                             agent_message_text(item),
+@@ -2472,7 +2473,7 @@ impl Session {
+             EventMsg::AgentMessageContentDelta(event) => {
+                 if let Err(err) = self
+                     .conversation
+-                    .stream_handoff_delta(&event.item_id, event.delta.clone())
++                    .stream_handoff_delta(turn_id, &event.item_id, event.delta.clone())
+                     .await
+                 {
+                     debug!("failed to stream event text to realtime conversation: {err}");
+@@ -2481,7 +2482,7 @@ impl Session {
+             }
+             EventMsg::ItemCompleted(event) => {
+                 if let TurnItem::AgentMessage(item) = &event.item
+-                    && self.conversation.finish_handoff_stream_item(&item.id).await
++                    && self.conversation.finish_handoff_stream_item(turn_id, &item.id).await
+                 {
+                     return;
+                 }
+@@ -2491,19 +2492,19 @@ impl Session {
+         let Some((text, phase)) = realtime_text_for_event(msg) else {
+             return;
+         };
+-        if let Err(err) = self.conversation.handoff_out(text, phase).await {
++        if let Err(err) = self.conversation.handoff_out(turn_id, text, phase).await {
+             debug!("failed to mirror event text to realtime conversation: {err}");
+         }
+     }
+ 
+-    async fn maybe_clear_realtime_handoff_for_event(&self, msg: &EventMsg) {
++    async fn maybe_clear_realtime_handoff_for_event(&self, turn_id: &str, msg: &EventMsg) {
+         if !matches!(msg, EventMsg::TurnComplete(_)) {
+             return;
+         }
+-        if let Err(err) = self.conversation.handoff_complete().await {
++        if let Err(err) = self.conversation.handoff_complete(turn_id).await {
+             debug!("failed to finalize realtime handoff output: {err}");
+         }
+-        self.conversation.clear_active_handoff().await;
++        self.conversation.clear_active_handoff(turn_id).await;
+     }
+ 
+     pub(crate) async fn send_event_raw(&self, event: Event) {
+diff --git a/codex-rs/core/src/session/turn_input.rs b/codex-rs/core/src/session/turn_input.rs
+index d08dcd62a9fc77c526f8b3ef8aef43f5cc87babf..93a4947c2909a2afd6bd11dc58d97236bd034146 100644
+--- a/codex-rs/core/src/session/turn_input.rs
++++ b/codex-rs/core/src/session/turn_input.rs
+@@ -436,6 +436,10 @@ async fn start_if_idle(
+         .maybe_emit_model_warnings_for_turn(turn_context.as_ref())
+         .await;
+ 
++    let voice_client_id = match &input {
++        SubmittedTurnInput::UserInput { client_id, .. } => client_id.clone(),
++        _ => None,
++    };
+     let mut task_input = merge_additional_context_input(session, additional_context).await;
+     match kind {
+         TurnStartKind::User => {
+@@ -461,6 +465,14 @@ async fn start_if_idle(
+             // Recovery resumes an existing turn without a new empty user message.
+         }
+     }
++    // Bind after Core accepts StartIfIdle, before any task/output can execute.
++    // Host queue receipt publication happens later and is too late for routing.
++    if let Err(error) = session.conversation
++        .activate_voice_turn(&submission_id, voice_client_id.as_deref()).await
++    {
++        session.clear_reserved_idle_turn(&turn_state).await;
++        return Err(CodexErr::InvalidRequest(error.to_string()));
++    }
+     session
+         .start_task(turn_context, task_input, RegularTask::new())
+         .await;
+diff --git a/codex-rs/ext/queue/src/service.rs b/codex-rs/ext/queue/src/service.rs
+index 898f0e11e6caff5fdbaa5c2ea20e45d5c7e17dd8..692b4913a4498697a9ede1f2dbd5ee84cc8d23f4 100644
+--- a/codex-rs/ext/queue/src/service.rs
++++ b/codex-rs/ext/queue/src/service.rs
+@@ -337,6 +337,7 @@ impl QueuedItemService {
+     pub async fn reconcile_voice_started(
+         &self,
+         thread_id: ThreadId,
++        native_session_id: String,
+         origin_id: String,
+         client_id: String,
+         turn_id: String,
+@@ -344,7 +345,7 @@ impl QueuedItemService {
+         let receipt = {
+             let _guard = self.dispatch_guard(thread_id).await;
+             let receipt = self.queue.reconcile_voice_started(
+-                thread_id, origin_id, client_id, turn_id,
++                thread_id, native_session_id, origin_id, client_id, turn_id,
+             ).await?;
+             self.emit_changed(thread_id);
+             receipt
+diff --git a/codex-rs/ext/queue/tests/queue_service.rs b/codex-rs/ext/queue/tests/queue_service.rs
+index 7b6554f64eb6f90414649c39511fec2a600f240c..815e8604e76403fc5c6cd58a654883998001f7c0 100644
+--- a/codex-rs/ext/queue/tests/queue_service.rs
++++ b/codex-rs/ext/queue/tests/queue_service.rs
+@@ -77,12 +77,17 @@ async fn voice_manual_and_idle_dispatch_share_durable_receipts() -> anyhow::Resu
+     let queue = loaded_thread_queue(&test)?;
+     let staged = QueuedItemService::new(Arc::clone(&queue), Weak::new(), Arc::new(NoopExtensionEventSink));
+     let origin = VoiceQueueOrigin {
++        native_session_id: "native-session-A".to_string(),
+         voice_session_generation: 1,
+         origin_id: "voice-generation-nonce/utterance-1".to_string(),
+         handoff_id: Some("handoff".to_string()),
+         item_id: Some("item".to_string()),
+     };
+     let queued = staged.enqueue_voice(thread_id, user_input("one utterance"), origin.clone()).await?;
++    assert_eq!(origin.native_session_id, queued.native_session_id);
++    let mut wrong_session = origin.clone();
++    wrong_session.native_session_id = "native-session-B".to_string();
++    assert!(staged.enqueue_voice(thread_id, user_input("one utterance"), wrong_session).await.is_err());
+     assert_eq!(queued, staged.enqueue_voice(thread_id, user_input("one utterance"), origin.clone()).await?);
+     assert!(staged.enqueue_voice(thread_id, user_input("conflicting utterance"), origin.clone()).await.is_err());
+     assert!(matches!(staged.update(thread_id, queued.queued_item_id.clone(), user_input("changed")).await,
+diff --git a/codex-rs/state/queue_migrations/0004_voice_native_session.sql b/codex-rs/state/queue_migrations/0004_voice_native_session.sql
+new file mode 100644
+index 0000000000000000000000000000000000000000..2abc7ea4e0a1622f64bdab88c0804d2e9acb644e
+--- /dev/null
++++ b/codex-rs/state/queue_migrations/0004_voice_native_session.sql
+@@ -0,0 +1,22 @@
++-- Preserve pre-session receipts without inventing a native session identity.
++-- These NULL rows cannot be claimed, reconciled, or emitted as typed receipts.
++ALTER TABLE voice_admission_receipts
++ADD COLUMN native_session_id TEXT CHECK (
++    native_session_id IS NULL OR length(trim(native_session_id)) > 0
++);
++
++CREATE TRIGGER voice_native_session_required_on_insert
++BEFORE INSERT ON voice_admission_receipts
++WHEN NEW.native_session_id IS NULL OR length(trim(NEW.native_session_id)) = 0
++BEGIN
++    SELECT RAISE(ABORT, 'native session id is required');
++END;
++
++-- NULL from the old schema also stays immutable: an operator cannot silently
++-- upgrade an old receipt into playback eligibility by attaching today's session.
++CREATE TRIGGER voice_native_session_immutable
++BEFORE UPDATE OF native_session_id ON voice_admission_receipts
++WHEN NEW.native_session_id IS NOT OLD.native_session_id
++BEGIN
++    SELECT RAISE(ABORT, 'native session binding is immutable');
++END;
+diff --git a/codex-rs/state/src/model/queued_item.rs b/codex-rs/state/src/model/queued_item.rs
+index 9c93260388563c198ccd75efce9b8456e28d6a7d..898332552e78dfa5c09af4d963828b90c773beb3 100644
+--- a/codex-rs/state/src/model/queued_item.rs
++++ b/codex-rs/state/src/model/queued_item.rs
+@@ -8,6 +8,7 @@ use sqlx::sqlite::SqliteRow;
+ /// An opaque provider utterance key, already scoped by the caller to its origin.
+ #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+ pub struct VoiceQueueOrigin {
++    pub native_session_id: String,
+     pub voice_session_generation: u64,
+     pub origin_id: String,
+     pub handoff_id: Option<String>,
+@@ -29,6 +30,7 @@ pub enum VoiceAdmissionResult {
+ pub struct VoiceAdmissionReceipt {
+     pub schema: String,
+     pub thread_id: ThreadId,
++    pub native_session_id: String,
+     pub voice_session_generation: u64,
+     pub origin_id: String,
+     pub handoff_id: Option<String>,
+@@ -71,10 +73,15 @@ impl VoiceAdmissionReceipt {
+             "Cancelled" => VoiceAdmissionResult::Cancelled,
+             _ => anyhow::bail!("invalid voice admission state"),
+         };
++        let native_session_id: Option<String> = row.try_get("native_session_id")?;
++        let native_session_id = native_session_id
++            .filter(|value| !value.trim().is_empty())
++            .ok_or_else(|| anyhow::anyhow!("voice receipt has no native session binding"))?;
+         let queued_item_id: String = row.try_get("queued_item_id")?;
+         Ok(Self {
+             schema: "fdv.voice.admission.v1".to_string(),
+             thread_id: ThreadId::try_from(row.try_get::<String, _>("thread_id")?)?,
++            native_session_id,
+             voice_session_generation: u64::try_from(row.try_get::<i64, _>("voice_session_generation")?)?,
+             origin_id: row.try_get("origin_id")?,
+             handoff_id: row.try_get("handoff_id")?,
+diff --git a/codex-rs/state/src/runtime/queued_items_tests.rs b/codex-rs/state/src/runtime/queued_items_tests.rs
+index 2022f5a113bc91a46c8dcfa3fb37ae44b3295b7e..ba5a2e0e580eb1c4fc7bf55403a5a39a3d4a18aa 100644
+--- a/codex-rs/state/src/runtime/queued_items_tests.rs
++++ b/codex-rs/state/src/runtime/queued_items_tests.rs
+@@ -9,6 +9,7 @@ use std::borrow::Cow;
+ 
+ fn voice_origin(id: &str) -> crate::VoiceQueueOrigin {
+     crate::VoiceQueueOrigin {
++        native_session_id: "native-session-A".to_string(),
+         voice_session_generation: 1,
+         origin_id: id.to_string(),
+         handoff_id: Some("handoff".to_string()),
+@@ -43,6 +44,13 @@ async fn voice_origin_replay_cannot_replace_input_or_recreate_a_started_item() {
+         queue.enqueue_voice(thread_id, &payload, &origin).await.unwrap(),
+     );
+     assert!(queue.enqueue_voice(thread_id, &voice_payload(&origin, "changed"), &origin).await.is_err());
++    assert_eq!(origin.native_session_id, receipt.native_session_id);
++    let mut wrong_session = origin.clone();
++    wrong_session.native_session_id = "native-session-B".to_string();
++    assert!(queue.enqueue_voice(thread_id, &payload, &wrong_session).await.is_err());
++    let mut blank_session = origin.clone();
++    blank_session.native_session_id = " ".to_string();
++    assert!(queue.enqueue_voice(thread_id, &payload, &blank_session).await.is_err());
+     assert_eq!(Some(receipt.clone()), queue.get_voice_receipt(thread_id, &origin.origin_id).await.unwrap());
+     queue.claim_voice(thread_id, &receipt.queued_item_id, "attempt-1").await.unwrap().unwrap();
+     let started = queue.finish_voice_claim(thread_id, &receipt.queued_item_id, "attempt-1",
+@@ -93,14 +101,15 @@ async fn voice_claim_survives_restart_and_only_positive_reconciliation_dequeues(
+     expected.reason = Some("lost receipt".to_string());
+     assert_eq!(expected, ambiguous);
+     assert_eq!(None, queue.claim_voice(thread_id, &receipt.queued_item_id, "retry").await.unwrap());
+-    assert!(queue.reconcile_voice_started(thread_id, &origin.origin_id, "wrong-client", "turn").await.is_err());
+-    let started = queue.reconcile_voice_started(thread_id, &origin.origin_id, &origin.origin_id, "turn").await.unwrap();
++    assert!(queue.reconcile_voice_started(thread_id, &origin.native_session_id, &origin.origin_id, "wrong-client", "turn").await.is_err());
++    assert!(queue.reconcile_voice_started(thread_id, "native-session-B", &origin.origin_id, &origin.origin_id, "turn").await.is_err());
++    let started = queue.reconcile_voice_started(thread_id, &origin.native_session_id, &origin.origin_id, &origin.origin_id, "turn").await.unwrap();
+     expected.admission_result = VoiceAdmissionResult::Started;
+     expected.reason = None;
+     expected.turn_id = Some("turn".to_string());
+     assert_eq!(expected, started);
+-    assert_eq!(started, queue.reconcile_voice_started(thread_id, &origin.origin_id, &origin.origin_id, "turn").await.unwrap());
+-    assert!(queue.reconcile_voice_started(thread_id, &origin.origin_id, &origin.origin_id, "different-turn").await.is_err());
++    assert_eq!(started, queue.reconcile_voice_started(thread_id, &origin.native_session_id, &origin.origin_id, &origin.origin_id, "turn").await.unwrap());
++    assert!(queue.reconcile_voice_started(thread_id, &origin.native_session_id, &origin.origin_id, &origin.origin_id, "different-turn").await.is_err());
+     assert!(queue.list_page(thread_id, /*offset*/ 0, /*limit*/ 1).await.unwrap().is_empty());
+ }
+ 
+@@ -140,6 +149,50 @@ async fn voice_busy_release_is_attempt_scoped_and_cancellation_keeps_tombstone()
+ }
+ 
+ 
++#[tokio::test]
++async fn migrating_receipts_cannot_invent_a_native_session() {
++    let home = unique_temp_dir();
++    tokio::fs::create_dir_all(&home).await.unwrap();
++    let sqlite = crate::SqliteConfig::new_for_testing(home.as_path().abs());
++    let old_queue_migrator = Migrator {
++        migrations: Cow::Owned(QUEUE_MIGRATOR.migrations.iter().take(3).cloned().collect()),
++        ignore_missing: false,
++        locking: true,
++        no_tx: false,
++        table_name: QUEUE_MIGRATOR.table_name.clone(),
++        create_schemas: QUEUE_MIGRATOR.create_schemas.clone(),
++    };
++    let pool = sqlite.open_read_write_pool(&sqlite.queue_db_path()).await.unwrap();
++    old_queue_migrator.run(&pool).await.unwrap();
++    let thread_id = ThreadId::new();
++    sqlx::query(
++        "INSERT INTO voice_admission_receipts
++         (thread_id, origin_id, voice_session_generation, queued_item_id, client_id, payload_json, admission_result)
++         VALUES (?, 'old-origin', 1, 'old-queue', 'old-origin', '{}', 'Queued')",
++    ).bind(thread_id.to_string()).execute(&pool).await.unwrap();
++    sqlx::query(
++        "INSERT INTO queued_items
++         (id, thread_id, payload_json, queue_order, created_at_ms, updated_at_ms)
++         VALUES ('old-queue', ?, '{}', 0, 0, 0)",
++    ).bind(thread_id.to_string()).execute(&pool).await.unwrap();
++    QUEUE_MIGRATOR.run(&pool).await.unwrap();
++    let native_session: Option<String> = sqlx::query_scalar(
++        "SELECT native_session_id FROM voice_admission_receipts WHERE origin_id = 'old-origin'",
++    ).fetch_one(&pool).await.unwrap();
++    assert_eq!(None, native_session);
++    assert!(sqlx::query(
++        "UPDATE voice_admission_receipts SET native_session_id = 'invented' WHERE origin_id = 'old-origin'",
++    ).execute(&pool).await.is_err());
++    pool.close().await;
++    let runtime = StateRuntime::init(sqlite, "test-provider".to_string()).await.unwrap();
++    let queue = runtime.thread_queue();
++    assert!(queue.get_voice_receipt(thread_id, "old-origin").await.is_err());
++    assert_eq!(None, queue.claim_voice(thread_id, "old-queue", "attempt").await.unwrap());
++    assert!(queue.reconcile_voice_started(thread_id, "invented", "old-origin", "old-origin", "turn").await.is_err());
++    assert_eq!(1, queue.list_page(thread_id, 0, 10).await.unwrap().len());
++}
++
++
+ async fn runtime_with_thread() -> (Arc<StateRuntime>, ThreadId) {
+     let home = unique_temp_dir();
+     let runtime = StateRuntime::init(
+diff --git a/codex-rs/state/src/runtime/queued_voice.rs b/codex-rs/state/src/runtime/queued_voice.rs
+index 487fcd4adda92cb736b7ea294ad2e3bd48301c12..4cc13b7d770d4caf225f0bdd8fe960788dcfd0a1 100644
+--- a/codex-rs/state/src/runtime/queued_voice.rs
++++ b/codex-rs/state/src/runtime/queued_voice.rs
+@@ -13,9 +13,9 @@ use uuid::Uuid;
+ // statements used by Rust, rather than a second implementation of the queue.
+ const ENQUEUE_VOICE_RECEIPT_SQL: &str = r#"
+ INSERT INTO voice_admission_receipts (
+-    thread_id, origin_id, voice_session_generation, handoff_id, item_id,
++    thread_id, origin_id, native_session_id, voice_session_generation, handoff_id, item_id,
+     queued_item_id, client_id, payload_json, admission_result
+-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Queued')
++) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'Queued')
+ ON CONFLICT(thread_id, origin_id) DO NOTHING
+ "#;
+ const ENQUEUE_VOICE_ITEM_SQL: &str = r#"
+@@ -30,6 +30,7 @@ const GET_VOICE_ITEM_RECEIPT_SQL: &str =
+ const CLAIM_VOICE_SQL: &str = r#"
+ UPDATE voice_admission_receipts SET admission_result = 'Claimed', attempt_id = ?, reason = NULL
+ WHERE thread_id = ? AND queued_item_id = ? AND admission_result = 'Queued'
++AND native_session_id IS NOT NULL AND length(trim(native_session_id)) > 0
+ AND EXISTS (
+     SELECT 1 FROM queued_items WHERE id = queued_item_id
+       AND thread_id = voice_admission_receipts.thread_id
+@@ -46,13 +47,15 @@ const FINISH_VOICE_CLAIM_SQL: &str = r#"
+ UPDATE voice_admission_receipts
+ SET admission_result = ?, turn_id = ?, reason = ?, attempt_id = ?
+ WHERE thread_id = ? AND queued_item_id = ? AND admission_result = 'Claimed' AND attempt_id = ?
++AND native_session_id IS NOT NULL AND length(trim(native_session_id)) > 0
+ RETURNING *
+ "#;
+ const REMOVE_VOICE_ITEM_SQL: &str =
+     "DELETE FROM queued_items WHERE thread_id = ? AND id = ?";
+ const RECONCILE_VOICE_STARTED_SQL: &str = r#"
+ UPDATE voice_admission_receipts SET admission_result = 'Started', turn_id = ?, reason = NULL
+-WHERE thread_id = ? AND origin_id = ? AND client_id = ?
++WHERE thread_id = ? AND native_session_id = ? AND origin_id = ? AND client_id = ?
++AND length(trim(native_session_id)) > 0
+ AND (admission_result IN ('Claimed', 'Ambiguous') OR (admission_result = 'Started' AND turn_id = ?))
+ RETURNING *
+ "#;
+@@ -66,6 +69,7 @@ impl SqliteQueueStore {
+         origin: &VoiceQueueOrigin,
+     ) -> anyhow::Result<VoiceEnqueueOutcome> {
+         anyhow::ensure!(!origin.origin_id.is_empty(), "voice origin id is empty");
++        anyhow::ensure!(!origin.native_session_id.trim().is_empty(), "native session id is empty");
+         anyhow::ensure!(origin.voice_session_generation > 0, "invalid voice generation");
+         let input: serde_json::Value = serde_json::from_str(payload_json)?;
+         anyhow::ensure!(
+@@ -80,6 +84,7 @@ impl SqliteQueueStore {
+         let inserted = sqlx::query(ENQUEUE_VOICE_RECEIPT_SQL)
+             .bind(thread_id.to_string())
+             .bind(&origin.origin_id)
++            .bind(&origin.native_session_id)
+             .bind(generation)
+             .bind(&origin.handoff_id)
+             .bind(&origin.item_id)
+@@ -97,6 +102,7 @@ impl SqliteQueueStore {
+         let receipt = VoiceAdmissionReceipt::try_from_row(&row)?;
+         anyhow::ensure!(
+             row.try_get::<String, _>("payload_json")? == payload_json
++                && receipt.native_session_id == origin.native_session_id
+                 && receipt.voice_session_generation == origin.voice_session_generation
+                 && receipt.handoff_id == origin.handoff_id
+                 && receipt.item_id == origin.item_id,
+@@ -222,16 +228,19 @@ impl SqliteQueueStore {
+     pub async fn reconcile_voice_started(
+         &self,
+         thread_id: ThreadId,
++        native_session_id: &str,
+         origin_id: &str,
+         client_id: &str,
+         turn_id: &str,
+     ) -> anyhow::Result<VoiceAdmissionReceipt> {
+         anyhow::ensure!(!turn_id.is_empty(), "voice turn id is empty");
+         anyhow::ensure!(client_id == origin_id, "voice reconciliation client id mismatch");
++        anyhow::ensure!(!native_session_id.trim().is_empty(), "native session id is empty");
+         let mut transaction = self.pool.begin().await?;
+         let row = sqlx::query(RECONCILE_VOICE_STARTED_SQL)
+             .bind(turn_id)
+             .bind(thread_id.to_string())
++            .bind(native_session_id)
+             .bind(origin_id)
+             .bind(client_id)
+             .bind(turn_id)
+diff --git a/codex-rs/thread-store/src/queue_store.rs b/codex-rs/thread-store/src/queue_store.rs
+index 414d7b637eb192a57b06882648dc3afe137d3abe..2025e669aae1cbefc497c61f0d68f8a156441990 100644
+--- a/codex-rs/thread-store/src/queue_store.rs
++++ b/codex-rs/thread-store/src/queue_store.rs
+@@ -69,6 +69,7 @@ pub trait QueueStore: Send + Sync {
+     fn reconcile_voice_started(
+         &self,
+         _thread_id: ThreadId,
++        _native_session_id: String,
+         _origin_id: String,
+         _client_id: String,
+         _turn_id: String,
+@@ -204,12 +205,13 @@ impl QueueStore for LocalQueueStore {
+     fn reconcile_voice_started(
+         &self,
+         thread_id: ThreadId,
++        native_session_id: String,
+         origin_id: String,
+         client_id: String,
+         turn_id: String,
+     ) -> ThreadStoreFuture<'_, VoiceAdmissionReceipt> {
+         queue_future(async move {
+-            self.queue().reconcile_voice_started(thread_id, &origin_id, &client_id, &turn_id).await
++            self.queue().reconcile_voice_started(thread_id, &native_session_id, &origin_id, &client_id, &turn_id).await
+         })
+     }
+ 
+diff --git a/fdv/e2e_fake.py b/fdv/e2e_fake.py
+index d2d618c4f835b2164f9c5ce98adad9d3708e139e..41a9e6e5e34f83a94e13e1ff4b9067e95a7f0135 100644
+--- a/fdv/e2e_fake.py
++++ b/fdv/e2e_fake.py
+@@ -9,7 +9,7 @@ import uuid
+ 
+ ROOT=Path(__file__).resolve().parent
+ sys.path.insert(0,str(ROOT/'producer'))
+-from final_producer import poll_once
++from final_producer import poll_once, read_playback_evidence
+ 
+ admission_path=Path(sys.argv[1]).resolve(strict=True)
+ if not admission_path.is_relative_to(ROOT) or admission_path.name!='E2E-ADMISSION.json':
+@@ -17,13 +17,16 @@ if not admission_path.is_relative_to(ROOT) or admission_path.name!='E2E-ADMISSIO
+ admission=json.loads(admission_path.read_text())
+ if admission['scope']!='FAKE_CORE_REAL_CANDIDATE_SQL':raise SystemExit('FAKE_SCOPE_REQUIRED')
+ r=admission['receipt']
+-authorization={k:r[k] for k in ('thread_id','voice_session_generation','origin_id','client_id','queued_item_id','input_digest')}
+-authorization.update(schema='fdv.voice.authorization.v1',state='Active')
++authorization={k:r[k] for k in ('thread_id','native_session_id','voice_session_generation','origin_id','client_id','queued_item_id','input_digest')}
++authorization.update(schema='fdv.voice.authorization.v1',state='Active',job_generation=0)
+ out=ROOT/'producer'/('e2e-'+uuid.uuid4().hex);out.mkdir()
+ capture=poll_once(Path(admission['source_path']),r['thread_id'],out/'journal.sqlite',admission_receipts=[r],authorization=authorization)
+ if capture['journal_status_counts'].get('ELIGIBLE_FAKE_ONLY')!=1 or capture['egress_authorized']:
+     raise SystemExit('PRODUCER_FAKE_ELIGIBILITY_FAILED')
+-bridge={'scope':'E2E_FAKE_ONLY_NO_AUDIO','receipt':r,'authorization':authorization,
++evidence=read_playback_evidence(Path(admission['source_path']),r['thread_id'],out/'journal.sqlite',
++    (r['thread_id'],r['turn_id'],admission['final_agent_item_id']),
++    admission_receipts=[r],authorization=authorization)
++bridge={'playback_evidence':evidence,'scope':'E2E_FAKE_ONLY_NO_AUDIO','receipt':r,'authorization':authorization,
+         'final_agent_item_id':admission['final_agent_item_id'],'producer':capture}
+ bridge_path=out/'BRIDGE.json';bridge_path.write_text(json.dumps(bridge,indent=2)+'\n')
+ result=subprocess.run(['node',str(ROOT/'e2e_playback.mjs'),str(bridge_path)],capture_output=True,text=True,timeout=10)
+@@ -36,12 +39,14 @@ assert closed['journal_status_counts'].get('ELIGIBLE_FAKE_ONLY',0)==0
+ receipt={'schema':'fdv.voice.e2e.fake.v1','result':'PASS','real_core':False,
+  'rust_executed':False,'voice_windows_elevenlabs_network':False,
+  'admission_source_sha256':hashlib.sha256(admission_path.read_bytes()).hexdigest(),
+- 'thread_id':r['thread_id'],'voice_session_generation':r['voice_session_generation'],
++ 'thread_id':r['thread_id'],'native_session_id':r['native_session_id'],
++ 'voice_session_generation':r['voice_session_generation'],'job_generation':0,
+  'origin_id':r['origin_id'],'client_id':r['client_id'],'queued_item_id':r['queued_item_id'],
+  'turn_id':r['turn_id'],'final_agent_item_id':admission['final_agent_item_id'],
+  'producer':capture,'boundary':boundary,'producer_after_revocation':closed,
+  'source_hashes':{str(p.relative_to(ROOT)):hashlib.sha256(p.read_bytes()).hexdigest()
+    for p in [Path(__file__),ROOT/'e2e_playback.mjs',ROOT/'producer/final_producer.py',
+-             ROOT/'producer/admission_gate.py',ROOT/'native-boundary/index.mjs']}}
++             ROOT/'producer/admission_gate.py',ROOT/'native-boundary/index.mjs',
++             ROOT/'native-boundary/playback-evidence.mjs']}}
+ path=out/'END_TO_END_FAKE_RECEIPT.json';path.write_text(json.dumps(receipt,indent=2)+'\n')
+ print(json.dumps({'result':'PASS','receipt':str(path),'sha256':hashlib.sha256(path.read_bytes()).hexdigest()},indent=2))
+diff --git a/fdv/e2e_playback.mjs b/fdv/e2e_playback.mjs
+index e6a08988fcc18176790d722eee3990c18b9f319d..e294ded33ccfede7bc77fefde1a361d993533815 100644
+--- a/fdv/e2e_playback.mjs
++++ b/fdv/e2e_playback.mjs
+@@ -9,20 +9,27 @@ assert.equal(input.scope,'E2E_FAKE_ONLY_NO_AUDIO');
+ assert.equal(input.producer.journal_status_counts.ELIGIBLE_FAKE_ONLY,1);
+ assert.equal(input.producer.egress_authorized,false);
+ const r=input.receipt;
+-const scope={threadId:r.thread_id,nativeSessionId:'FAKE_SESSION',voiceGeneration:r.voice_session_generation,ownerId:'FAKE_OWNER'};
++const scope={threadId:r.thread_id,nativeSessionId:r.native_session_id,voiceGeneration:r.voice_session_generation,ownerId:'FAKE_OWNER'};
+ const adapter=createFakeAdapter();
+ const b=createNativeVoiceBoundary({adapter});
+ assert.equal((await b.beginSession(scope)).status,'READY_MUTED');
+ assert.equal((await b.playNativeOutput(scope)).status,'PLAYED_MUTED');
+-const job={scope,jobGeneration:0};
+-assert.equal(b.gateVaiJob(job).allowed,true);
++const authorize=()=>b.authorizeVaiPlayback({scope,readProducerEvidence:()=>input.playback_evidence});
++const combined=await authorize();
++assert.equal(combined.status,'READY_FOR_TTS');
++assert.equal(combined.egressAuthorized,false);
++const wrongScope={...scope,nativeSessionId:'WRONG_NATIVE_SESSION'};
++const wrong=createNativeVoiceBoundary({adapter:createFakeAdapter()});
++await wrong.beginSession(wrongScope);
++assert.equal((await wrong.authorizeVaiPlayback({scope:wrongScope,readProducerEvidence:()=>input.playback_evidence})).status,'HOLD');
++await wrong.closeVoice(wrongScope);
+ const jobId=JSON.stringify([r.thread_id,r.turn_id,input.final_agent_item_id]);
+ adapter.registerFakePlayer(jobId,scope,0);
+ const onset={scope,eventId:'FAKE_SPEECH_ONSET',origin:'FAKE_FIXTURE'};
+ const one=await b.speechOnset(onset);
+ assert.deepEqual(await b.speechOnset(onset),one);
+ assert.equal(adapter.playerHandles.get(jobId).stopped,true);
+-assert.equal(b.gateVaiJob(job).allowed,false); // delayed TTS/master callback
++assert.equal((await authorize()).status,'HOLD'); // delayed TTS/master callback must re-enter combined gate
+ assert.equal((await b.closeVoice(scope)).status,'CLOSED');
+ const successor={...scope,voiceGeneration:scope.voiceGeneration+1,nativeSessionId:'FAKE_SUCCESSOR'};
+ assert.equal((await b.beginSession(successor)).status,'READY_MUTED');
+@@ -32,6 +39,7 @@ assert.equal(adapter.calls.length,calls);
+ assert.equal(b.gateVaiJob({scope:successor,jobGeneration:0}).allowed,true);
+ assert.equal((await b.closeVoice(successor)).status,'CLOSED');
+ console.log(JSON.stringify({result:'PASS',fake_player_only:true,
++ combined_gate:combined,wrong_native_same_thread_generation_denied:true,
+  mute_before_play:true,duplicate_onset_deduplicated:true,late_callback_rejected:true,
+  old_close_did_not_touch_successor:true,core_subscription_preserved:true,
+  events:b.events(),calls:adapter.calls.map(c=>({method:c.method,scope:c.request.scope}))}));
+diff --git a/fdv/native-boundary/MANIFEST-SHA256.txt b/fdv/native-boundary/MANIFEST-SHA256.txt
+index 2489412df3a980db00228be96a8aafc646752f45..c4d8c387cf29247accd8bb76c83c38bd4b1d9f19 100644
+--- a/fdv/native-boundary/MANIFEST-SHA256.txt
++++ b/fdv/native-boundary/MANIFEST-SHA256.txt
+@@ -1,48 +1,39 @@
+-52b504ccc437a4b0a82361213d3e334a21110cf8629e40472b0382c3c210c234  README.md
+-52f93656b83288dad3d1034ad45c8f621ede1baf93f90fd79a5f494794c0aaf5  fake-adapter.mjs
+-ce60b74e055dbeedd43c1d75e4cb9478eed3446fb1033975516f744f44bb047b  index.d.ts
+-c2894126589bfc65be865f34b014c584ab347ee186fb72000d248d67e9d6cdab  index.mjs
+-81d248c824773b5bbf7201fcc0f3a2ef3984b36522e021ce9229aaa78b81a8a3  pre-composer-ack/README.md
+-c186218d3d6048145a4f882e32dbcf43bae59e185d20e4691e371b83dc62e362  pre-composer-ack/fake-adapter.mjs
+-748da63a4bdb16f1e5c863555ed4fde01e3bf5f923f88c0d875a7ee7d6cceeab  pre-composer-ack/index.d.ts
+-42dab36ff24ffaa5c9f7e51bb3dd885947c87a9f59379a57d15bb380d3611f1a  pre-composer-ack/index.mjs
+-30320785966f6f1727447def43f9639e7c9b3c182a25aa6dc717813111768296  pre-composer-ack/run-proof.py
+-e9495dd82cb407f1dfb3964009cc8125dc86f7628de2bb9ab3c9556905796f57  pre-composer-ack/test-native-boundary.mjs
+-d3d1146754f99706c2fa7441d1ba8cb16c00487790e8f72874d9fa7a7b838b16  proof-20260914T011530Z-abec5001/RECEIPT.json
+-6ff674fcb222311577c6a766b47e3f5da1923a966220149425c158cfd2ef57ee  proof-20260914T011530Z-abec5001/SHA256SUMS
+-e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  proof-20260914T011530Z-abec5001/negative-detailed.stderr.txt
+-6aba0aaf37880512100a7c4b51f244617e6232058eb84edb0fba366d535c21cf  proof-20260914T011530Z-abec5001/negative-detailed.stdout.txt
+-e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  proof-20260914T011530Z-abec5001/negative-node-test.stderr.txt
+-e69bdb51a0cedc881b369c15fa296f20a4084d1e2a7836b8d5977cbc97fa335a  proof-20260914T011530Z-abec5001/negative-node-test.stdout.txt
+-e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  proof-20260914T011530Z-abec5001/node-test-detailed.stderr.txt
+-afa8efb0637b66b64cfc55faf6e5ed47ee7b35eac970ccc391fab92aa58a4bd6  proof-20260914T011530Z-abec5001/node-test-detailed.stdout.txt
+-e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  proof-20260914T011530Z-abec5001/node-test.stderr.txt
+-1b3251a0c35c1ad1418499cccc06fcd74f4e43446d0df9d99138566143bdccb1  proof-20260914T011530Z-abec5001/node-test.stdout.txt
+-e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  proof-20260914T011530Z-abec5001/runtime.stderr.txt
+-87b2b075d6887cb88912ee32d80ae2cdc703e579719fa9716496d96f29667776  proof-20260914T011530Z-abec5001/runtime.stdout.txt
+-e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  proof-20260914T011530Z-abec5001/syntax-fake-adapter.mjs.stderr.txt
+-e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  proof-20260914T011530Z-abec5001/syntax-fake-adapter.mjs.stdout.txt
+-e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  proof-20260914T011530Z-abec5001/syntax-index.mjs.stderr.txt
+-e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  proof-20260914T011530Z-abec5001/syntax-index.mjs.stdout.txt
+-e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  proof-20260914T011530Z-abec5001/syntax-test-native-boundary.mjs.stderr.txt
+-e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  proof-20260914T011530Z-abec5001/syntax-test-native-boundary.mjs.stdout.txt
+-68322a3598263bdd41ae9dfd2da0a2b4f3c6bf726884054d33c3ad1be6a7ff82  proof-20260914T012455Z-fe390351/RECEIPT.json
+-69d9c863c5ddd28ad0d37ce9326d6d04b14d373d44e761d95bbfbf1b0dc846db  proof-20260914T012455Z-fe390351/SHA256SUMS
+-e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  proof-20260914T012455Z-fe390351/negative-detailed.stderr.txt
+-6a6f750e816195b2e72a8b0b9178cd8073e669dec1f863e91a4a39405ffe34cc  proof-20260914T012455Z-fe390351/negative-detailed.stdout.txt
+-e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  proof-20260914T012455Z-fe390351/negative-node-test.stderr.txt
+-ebad12fb6f9c36f08983cc5bbc3310c93eaa5fbe9fa6bbfd7076cad5b7f3af4b  proof-20260914T012455Z-fe390351/negative-node-test.stdout.txt
+-e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  proof-20260914T012455Z-fe390351/node-test-detailed.stderr.txt
+-ca470b84a0e0aa96b133e50baf36935658589d24bffd6f7ff181e7ad2c52d96a  proof-20260914T012455Z-fe390351/node-test-detailed.stdout.txt
+-e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  proof-20260914T012455Z-fe390351/node-test.stderr.txt
+-d251c6d74504f1ec7661cad51a3ee5469fbb24c8f79899a80a8b4a1c143b6050  proof-20260914T012455Z-fe390351/node-test.stdout.txt
+-e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  proof-20260914T012455Z-fe390351/runtime.stderr.txt
+-87b2b075d6887cb88912ee32d80ae2cdc703e579719fa9716496d96f29667776  proof-20260914T012455Z-fe390351/runtime.stdout.txt
+-e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  proof-20260914T012455Z-fe390351/syntax-fake-adapter.mjs.stderr.txt
+-e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  proof-20260914T012455Z-fe390351/syntax-fake-adapter.mjs.stdout.txt
+-e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  proof-20260914T012455Z-fe390351/syntax-index.mjs.stderr.txt
+-e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  proof-20260914T012455Z-fe390351/syntax-index.mjs.stdout.txt
+-e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  proof-20260914T012455Z-fe390351/syntax-test-native-boundary.mjs.stderr.txt
+-e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  proof-20260914T012455Z-fe390351/syntax-test-native-boundary.mjs.stdout.txt
+-2a48f677db399141d8075ae5fc20fa9c863af88e2b6bce7163e519c8bfac3159  run-proof.py
++9cc59deb8adb6997441c4855bd88bf5328c2f08320d6393c57c35a515f36f8a2  README.md
++f351b9ce030717f446f6af6a5bd375894d631d6e7a9cff453546c96f43b5e77d  fake-adapter.mjs
++204bc9c907beb7dcf504e1af95a1cc1fd29ed4b1db275157e19f850d25556d91  fixtures/PLAYBACK-EVIDENCE-FAKE.json
++d031dfcf977737647c6ab62a1d61af57497602cad344b8f32d7e61876308d6a6  index.d.ts
++6b8271d2ea2b999ad2323ca1af80b27bc98c89bedbd491a1b89233c06825703f  index.mjs
++21185687917b4800d2f0715a53238f3184400a1840106e25708a08a61b7b9f2d  playback-evidence.mjs
++3a46004159ab6b5ad14369d20ab6faac080e8d815a1bdf78e6a603c95d84321b  proof-20260914T021607Z-7ef99de9/RECEIPT.json
++1022d39f12fffaabe63a6147129d8ef1f30be9281096a276964fa3f0a012811f  proof-20260914T021607Z-7ef99de9/SHA256SUMS
++e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  proof-20260914T021607Z-7ef99de9/runtime.stderr.txt
++87b2b075d6887cb88912ee32d80ae2cdc703e579719fa9716496d96f29667776  proof-20260914T021607Z-7ef99de9/runtime.stdout.txt
++e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  proof-20260914T021607Z-7ef99de9/syntax-fake-adapter.mjs.stderr.txt
++e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  proof-20260914T021607Z-7ef99de9/syntax-fake-adapter.mjs.stdout.txt
++e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  proof-20260914T021607Z-7ef99de9/syntax-index.mjs.stderr.txt
++e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  proof-20260914T021607Z-7ef99de9/syntax-index.mjs.stdout.txt
++e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  proof-20260914T021607Z-7ef99de9/syntax-playback-evidence.mjs.stderr.txt
++e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  proof-20260914T021607Z-7ef99de9/syntax-playback-evidence.mjs.stdout.txt
++e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  proof-20260914T021607Z-7ef99de9/syntax-test-combined-playback.mjs.stderr.txt
++e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  proof-20260914T021607Z-7ef99de9/syntax-test-combined-playback.mjs.stdout.txt
++e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  proof-20260914T021607Z-7ef99de9/syntax-test-native-boundary.mjs.stderr.txt
++e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  proof-20260914T021607Z-7ef99de9/syntax-test-native-boundary.mjs.stdout.txt
++e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  proof-20260914T021607Z-7ef99de9/test-combined-playback.mjs-detailed.stderr.txt
++6903a653fd1bd4a929d229da4c588103984c39efa3b1c23941595c41cf87b48d  proof-20260914T021607Z-7ef99de9/test-combined-playback.mjs-detailed.stdout.txt
++e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  proof-20260914T021607Z-7ef99de9/test-combined-playback.mjs-negative-detailed.stderr.txt
++990aeafaabb3bc922d9beb9bd56f5ee5dadc09b2577db286485a89691ce2bebd  proof-20260914T021607Z-7ef99de9/test-combined-playback.mjs-negative-detailed.stdout.txt
++e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  proof-20260914T021607Z-7ef99de9/test-combined-playback.mjs-negative.stderr.txt
++2618320a6e9195f637c8cc7a536612466459c0369228cbc9b7c2804a26ab1600  proof-20260914T021607Z-7ef99de9/test-combined-playback.mjs-negative.stdout.txt
++e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  proof-20260914T021607Z-7ef99de9/test-combined-playback.mjs-runner.stderr.txt
++260f9a541412320860c51416514c2fd131af66a2620e52646ab33fcdd870206d  proof-20260914T021607Z-7ef99de9/test-combined-playback.mjs-runner.stdout.txt
++e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  proof-20260914T021607Z-7ef99de9/test-native-boundary.mjs-detailed.stderr.txt
++e8e0612e419609801b03f361bf3eb0ef371820ce605e3cb0ca775e821ba0f63b  proof-20260914T021607Z-7ef99de9/test-native-boundary.mjs-detailed.stdout.txt
++e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  proof-20260914T021607Z-7ef99de9/test-native-boundary.mjs-negative-detailed.stderr.txt
++31af0efc6e694bc09d039645c372c43b51db122993ee99cc9d4d11f87b026543  proof-20260914T021607Z-7ef99de9/test-native-boundary.mjs-negative-detailed.stdout.txt
++e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  proof-20260914T021607Z-7ef99de9/test-native-boundary.mjs-negative.stderr.txt
++b2085a6019774c9db49b4474dcc80a5c1e6597da332c0ec130b8680ea6f84bf3  proof-20260914T021607Z-7ef99de9/test-native-boundary.mjs-negative.stdout.txt
++e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  proof-20260914T021607Z-7ef99de9/test-native-boundary.mjs-runner.stderr.txt
++aadf553575096b3e7db14d5674afd5797f4797b9fac373042570ede104eefa0b  proof-20260914T021607Z-7ef99de9/test-native-boundary.mjs-runner.stdout.txt
++a87b7e8917d19349e567fbb72d961f3edcf92920bbce34f446f8536b0a7b4757  run-proof.py
++e2e3d25d33f9016ebe9725d67db4cb7843f7cb050f5a93fc1c3018630836659f  test-combined-playback.mjs
+ 61e2e4b8ef35ec8ea569e903d70853f078e979b26a1a35ea227066aa2aeb0de6  test-native-boundary.mjs
+diff --git a/fdv/native-boundary/README.md b/fdv/native-boundary/README.md
+index a841d832d00f75349177c453d3a0646934cba851..1e999a87cf1c4f4093096852ad49c8905aa12547 100644
+--- a/fdv/native-boundary/README.md
++++ b/fdv/native-boundary/README.md
+@@ -58,3 +58,38 @@ FDV_BOUNDARY_TEST_NEGATIVE=1 node --test test-native-boundary.mjs
+ O último comando deve falhar por INTENTIONAL_NEGATIVE_CONTROL. Nesta versão Node20 a invocação `--test` apresentou resumo por arquivo; execução direta do mesmo node:test revelou os 30 cenários. O controle negativo prova que o arquivo não foi aceito sem executar assertions. `run-proof.py` salva stdout/stderr, rc e hashes nesta pasta em uma subpasta nova, sem tocar fontes externas. Resultados sintéticos não são prova de áudio real.
+ 
+ Correção após revisão: a primeira bateria de 25 cenários exigia apenas detach/preservação no ACK, insuficiente para declarar composer utilizável. Esses recibos permanecem preservados; os seis arquivos anteriores estão congelados em `pre-composer-ack/`, somente evidência, não entrada do runner. A bateria atual acrescenta cinco cenários da pós-condição do composer, incluindo ausência de campos, falso pronto e backend ocupado legítimo. O hookup Windows continua NC.
++
++
++## Delta após revisão Sol — gate combinado
++
++`authorizeVaiPlayback({scope, readProducerEvidence})` é a única decisão combinada
++`READY_FOR_TTS`. `gateVaiJob` continua um fence necessário, sem authority de áudio.
++O método exige readback ativo do adapter da MESMA sessão nativa e owner, sink muted,
++prova atual do produtor relida depois do await e todos os joins thread/session/voice
++ generation/origin/client/turn/final/job generation. Não aceita um boolean PASS.
++
++`readProducerEvidence` deve ser um reader síncrono confiável da projeção corrente de
++fonte+journal, equivalente a `final_producer.read_playback_evidence` no domínio que
++detém essa leitura. O callback real entre Python e Desktop NÃO está implementado;
++nestes testes ele fornece fixtures extraídas de SQLite sintético. Hash de snapshot
++é integridade, não autenticação de autor/owner. O readback native também é FAKE.
++
++Onset/close durante o await e durante reader reentrante são novamente confrontados
++antes da decisão. Uma geração de job antiga não pode ser renovada por autorização
++nova. Os 93 thread/turn históricos são bloqueados novamente por ledger SHA fixo.
++
++Esta candidata não chama TTS nem player VAI. `egressAuthorized=false` e a decisão
++não é token reutilizável. O futuro consumer deve invocar esse gate imediatamente
++antes do efeito e novamente ao receber TTS/master atrasado; adapter deve fencear
++scope antes de cada efeito. Não há alegação de atomicidade entre processos ou
++Desktop, nem de autenticação de packet JSON arbitrário fornecido por caller.
++
++Novo método obrigatório do adapter: `observeLiveSession` retorna `LIVE_SESSION_ACK`
++com request operationId/scope, active=true, ownerCurrent=true, outputMuted=true e
++observation=SESSION_AND_SINK_READBACK. Sua implementação instalada permanece NC.
++
++`run-proof.py` mede 30 cenários da boundary anterior e 30 do gate combinado, com
++controles negativos de ambos os runners e contagens TAP explícitas. O stdout do
++`node --test` nesta bancada resume um arquivo; não é usado como contagem de casos.
++A declaração TypeScript anterior teve PASS externo informado pela Sol; o delta
++novo ainda precisa de tsc. Nenhum Windows/Voice/ElevenLabs nesta rodada.
+diff --git a/fdv/native-boundary/fake-adapter.mjs b/fdv/native-boundary/fake-adapter.mjs
+index 8cb3485bc1690103e5295ae4d87eda01eb27851d..a687cad0c6beb62673698b9303d1e639aa0a26b2 100644
+--- a/fdv/native-boundary/fake-adapter.mjs
++++ b/fdv/native-boundary/fake-adapter.mjs
+@@ -11,6 +11,12 @@ export function createFakeAdapter(overrides = {}) {
+     registerFakePlayer(jobId, scope, jobGeneration) { playerHandles.set(jobId, { scope, jobGeneration, stopped: false }); },
+     microphoneActive: true,
+     coreSubscriptionIdentity: 'FAKE_CORE_SUBSCRIPTION_UNCHANGED',
++    async observeLiveSession(request) {
++      const sink = sinks.get(key(request.scope));
++      return ack(request, 'LIVE_SESSION_ACK', { active: Boolean(sink && !sink.retired),
++        ownerCurrent: Boolean(sink && !sink.retired), outputMuted: sink?.muted === true,
++        observation: 'SESSION_AND_SINK_READBACK' });
++    },
+     async setOutputMuted(request) {
+       const sink = { muted: true, retired: false, playing: false };
+       sinks.set(key(request.scope), sink);
+@@ -36,7 +42,7 @@ export function createFakeAdapter(overrides = {}) {
+     },
+     async reconcilePresentation(request) { return ack(request, 'PRESENTATION_ACK', { presentationDetached: true, threadPreserved: true, backendSubscriptionsPreserved: true, composerUsable: true, independentBlockers: [] }); },
+   };
+-  for (const method of ['setOutputMuted', 'playNativeOutput', 'invalidateJobs', 'stopPlayer', 'teardownVoice', 'reconcilePresentation']) {
++  for (const method of ['observeLiveSession', 'setOutputMuted', 'playNativeOutput', 'invalidateJobs', 'stopPlayer', 'teardownVoice', 'reconcilePresentation']) {
+     const implementation = overrides[method] ?? adapter[method];
+     adapter[method] = async request => { calls.push({ method, request }); return implementation(request, adapter, ack); };
+   }
+diff --git a/fdv/native-boundary/fixtures/PLAYBACK-EVIDENCE-FAKE.json b/fdv/native-boundary/fixtures/PLAYBACK-EVIDENCE-FAKE.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..f4618aa6f8ca238032bed40e086e9fe82fe1a127
+--- /dev/null
++++ b/fdv/native-boundary/fixtures/PLAYBACK-EVIDENCE-FAKE.json
+@@ -0,0 +1,80 @@
++{
++  "schema": "fdv.voice.playback.evidence.v1",
++  "identity": {
++    "thread_id": "FAKE_THREAD",
++    "native_session_id": "FAKE_NATIVE_SESSION",
++    "voice_session_generation": 1,
++    "origin_id": "opaque_origin_without_generation_syntax",
++    "client_id": "opaque_origin_without_generation_syntax",
++    "queued_item_id": "FAKE_QUEUE",
++    "turn_id": "FAKE_TURN",
++    "final_agent_item_id": "FAKE_FINAL",
++    "first_user_item_id": "FAKE_USER",
++    "job_generation": 0
++  },
++  "source": {
++    "classification": "BACKEND_FINAL_PROVENANCE_NC",
++    "turn_status": "completed",
++    "final_pointer": "FAKE_FINAL",
++    "final_item_id": "FAKE_FINAL",
++    "final_item": {
++      "id": "FAKE_FINAL",
++      "type": "agentMessage",
++      "text": "FAKE final text.\n",
++      "phase": "final_answer",
++      "delivery": null,
++      "questions": []
++    },
++    "first_user_item_id": "FAKE_USER",
++    "first_user": {
++      "id": "FAKE_USER",
++      "type": "userMessage",
++      "client_id": "opaque_origin_without_generation_syntax",
++      "valid": true
++    },
++    "version_sha256": "9fcb80d85652fa48d416e00b9561803d5068d48e3d6bbb3a2836d995c873e51e",
++    "text_sha256": "b8ca3fef13bda78e4f378fdc93522ef66c535bab88c35a7de135a34bcb3402c7"
++  },
++  "journal": {
++    "status": "ELIGIBLE_FAKE_ONLY",
++    "original_version_sha256": "9fcb80d85652fa48d416e00b9561803d5068d48e3d6bbb3a2836d995c873e51e",
++    "text_sha256": "b8ca3fef13bda78e4f378fdc93522ef66c535bab88c35a7de135a34bcb3402c7",
++    "native_session_id": "FAKE_NATIVE_SESSION",
++    "voice_session_generation": 1,
++    "job_generation": 0,
++    "original_receipt_sha256": "94075281a1b78f1dc98dae161bb323f41dc6497088c05f9f7c9acd1f523d0155"
++  },
++  "admission_receipt": {
++    "schema": "fdv.voice.admission.v1",
++    "receipt_id": "FAKE_QUEUE",
++    "thread_id": "FAKE_THREAD",
++    "native_session_id": "FAKE_NATIVE_SESSION",
++    "voice_session_generation": 1,
++    "origin_id": "opaque_origin_without_generation_syntax",
++    "handoff_id": null,
++    "item_id": null,
++    "client_id": "opaque_origin_without_generation_syntax",
++    "queued_item_id": "FAKE_QUEUE",
++    "turn_id": "FAKE_TURN",
++    "admission_result": "Started",
++    "attempt_id": "FAKE_ATTEMPT",
++    "input_digest": null
++  },
++  "authorization": {
++    "schema": "fdv.voice.authorization.v1",
++    "state": "Active",
++    "job_generation": 0,
++    "thread_id": "FAKE_THREAD",
++    "native_session_id": "FAKE_NATIVE_SESSION",
++    "voice_session_generation": 1,
++    "origin_id": "opaque_origin_without_generation_syntax",
++    "client_id": "opaque_origin_without_generation_syntax",
++    "queued_item_id": "FAKE_QUEUE",
++    "input_digest": null
++  },
++  "receipt_sha256": "94075281a1b78f1dc98dae161bb323f41dc6497088c05f9f7c9acd1f523d0155",
++  "authorization_sha256": "8dedccbb0311e87153552baec8f437ca09c4e4a9d3b872511a04ecbafa4d9bb2",
++  "provenance_only": true,
++  "egress_authorized": false,
++  "source_payload_digest_verified": false
++}
+diff --git a/fdv/native-boundary/index.d.ts b/fdv/native-boundary/index.d.ts
+index 1fffb307f622820b5dae338d9315a8da374d0baa..9592b34f5e2b3f63c53003ee3fba73b9a9a9e643 100644
+--- a/fdv/native-boundary/index.d.ts
++++ b/fdv/native-boundary/index.d.ts
+@@ -39,6 +39,7 @@ export interface JobFenceRequest extends AdapterRequest {
+  */
+ export interface NativeBoundaryAdapter {
+   readonly kind: AdapterKind;
++  observeLiveSession(request: AdapterRequest): Promise<Acknowledgement & { readonly type: 'LIVE_SESSION_ACK'; readonly active: true; readonly ownerCurrent: true; readonly outputMuted: true; readonly observation: 'SESSION_AND_SINK_READBACK' }>;
+   setOutputMuted(request: AdapterRequest & { readonly muted: true }): Promise<OutputMutedAck>;
+   playNativeOutput(request: AdapterRequest & { readonly requiredMuted: true; readonly mutedOperationId: string }): Promise<Acknowledgement & { readonly type: 'NATIVE_OUTPUT_PLAY_ACK'; readonly muted: true }>;
+   invalidateJobs(request: JobFenceRequest): Promise<Acknowledgement & { readonly type: 'JOBS_INVALIDATED_ACK'; readonly jobGeneration: number }>;
+@@ -78,6 +79,31 @@ export interface BoundaryEvent {
+   readonly adapterKind: AdapterKind;
+   readonly [key: string]: unknown;
+ }
++export interface PlaybackIdentity {
++  readonly thread_id: string;
++  readonly native_session_id: string;
++  readonly voice_session_generation: number;
++  readonly origin_id: string;
++  readonly client_id: string;
++  readonly queued_item_id: string;
++  readonly turn_id: string;
++  readonly final_agent_item_id: string;
++  readonly first_user_item_id: string;
++  readonly job_generation: number;
++  readonly text_sha256: string;
++  readonly receipt_sha256: string;
++}
++export interface CombinedPlaybackDecision {
++  readonly status: 'HOLD' | 'READY_FOR_TTS';
++  readonly readyForTts: boolean;
++  readonly egressAuthorized: false;
++  readonly reason?: string;
++  readonly authorizationOnly?: true;
++  readonly executionScope?: 'OFFLINE_FAKE' | 'NATIVE_ADAPTER_UNATTESTED';
++  readonly identity?: PlaybackIdentity;
++  readonly scope?: VoiceScope;
++  readonly jobGeneration?: number;
++}
+ export interface NativeVoiceBoundary {
+   beginSession(scope: VoiceScope): Promise<BoundaryResult>;
+   playNativeOutput(scope: VoiceScope): Promise<BoundaryResult>;
+@@ -91,6 +117,11 @@ export interface NativeVoiceBoundary {
+     scope?: VoiceScope;
+     jobGeneration?: number;
+   };
++  /** Sole combined readiness decision; invoke again at actual play after delayed TTS.
++   * Reader must synchronously supply current trusted source+journal evidence.
++   * This offline candidate performs no TTS/player effect and emits no reusable token.
++   */
++  authorizeVaiPlayback(input: { scope: VoiceScope; readProducerEvidence: () => unknown }): Promise<CombinedPlaybackDecision>;
+   snapshot(scope: VoiceScope): BoundarySnapshot | null;
+   events(): BoundaryEvent[];
+ }
+diff --git a/fdv/native-boundary/index.mjs b/fdv/native-boundary/index.mjs
+index 4f25df9758d0b6c2a0d70ec056595d31c7b9d557..c8c98e6c7d52b7f9a2d21d2edc277ce648498659 100644
+--- a/fdv/native-boundary/index.mjs
++++ b/fdv/native-boundary/index.mjs
+@@ -1,9 +1,10 @@
+ // Offline candidate. This module does not discover or connect to a Desktop host.
+ import { randomUUID } from 'node:crypto';
++import { verifyPlaybackEvidence } from './playback-evidence.mjs';
+ 
+ export const CANDIDATE_VERSION = 'FDV_NATIVE_VOICE_BOUNDARY_V1';
+ const SCOPE_KEYS = ['threadId', 'nativeSessionId', 'voiceGeneration', 'ownerId'];
+-const METHODS = ['setOutputMuted', 'playNativeOutput', 'invalidateJobs', 'stopPlayer', 'teardownVoice', 'reconcilePresentation'];
++const METHODS = ['observeLiveSession', 'setOutputMuted', 'playNativeOutput', 'invalidateJobs', 'stopPlayer', 'teardownVoice', 'reconcilePresentation'];
+ const INDEPENDENT_COMPOSER_BLOCKERS = ['backendBusy', 'permissionPrompt', 'threadReadOnly'];
+ 
+ function scopeOf(value) {
+@@ -122,6 +123,49 @@ export function createNativeVoiceBoundary({ adapter, timeoutMs = 1000 } = {}) {
+     return { allowed: true, reason: 'BOUNDARY_FENCE_ONLY', finalProvenanceAuthorized: false, scope: record.scope, jobGeneration };
+   }
+ 
++  // The only combined readiness decision. The producer reader must be a trusted,
++  // synchronous current source+journal projection, never a saved PASS boolean.
++  // This candidate emits no TTS or player effect and no reusable playback token.
++  async function authorizeVaiPlayback({ scope: value, readProducerEvidence } = {}) {
++    let scope, record;
++    const deny = reason => Object.freeze({ status: 'HOLD', readyForTts: false, egressAuthorized: false, reason });
++    try {
++      scope = scopeOf(value); record = find(scope);
++      if (!record || !active(record)) return deny('STALE_OR_UNKNOWN_SCOPE');
++      if (typeof readProducerEvidence !== 'function') return deny('CURRENT_PRODUCER_READER_REQUIRED');
++      const fence = record.jobGeneration;
++      const before = gateVaiJob({ scope, jobGeneration: fence });
++      if (!before.allowed) return deny(before.reason);
++      await request(record, 'observeLiveSession', 'LIVE_SESSION_ACK', {},
++        { active: true, ownerCurrent: true, outputMuted: true, observation: 'SESSION_AND_SINK_READBACK' });
++      // No awaits from current producer readback through the final decision. An
++      // onset/close or a reentrant reader still invalidates the captured fence.
++      const raw = readProducerEvidence();
++      if (raw?.then) {
++        // Reject asynchronous proof, but consume a rejection so a contract error
++        // cannot crash the controller after returning HOLD. Never await/authorize it.
++        Promise.resolve(raw).catch(() => {});
++        return deny('SYNCHRONOUS_PRODUCER_READER_REQUIRED');
++      }
++      const identity = verifyPlaybackEvidence(copy(raw));
++      if (identity.thread_id !== scope.threadId || identity.native_session_id !== scope.nativeSessionId
++        || identity.voice_session_generation !== scope.voiceGeneration) return deny('LIVE_NATIVE_SESSION_IDENTITY_MISMATCH');
++      if (identity.job_generation !== fence) return deny('PRODUCER_JOB_GENERATION_MISMATCH');
++      const after = gateVaiJob({ scope, jobGeneration: identity.job_generation });
++      if (!after.allowed) return deny(after.reason);
++      const decision = Object.freeze({ status: 'READY_FOR_TTS', readyForTts: true,
++        egressAuthorized: false, executionScope: adapter.kind === 'FAKE' ? 'OFFLINE_FAKE' : 'NATIVE_ADAPTER_UNATTESTED',
++        authorizationOnly: true, scope: record.scope, identity, jobGeneration: fence,
++        producerProvenance: 'PASS', admissionReceipt: 'PASS', liveNativeSession: 'PASS',
++        boundaryGeneration: 'PASS', muteFence: 'PASS' });
++      emit(record, 'VAI_COMBINED_GATE_READY', { originId: identity.origin_id, turnId: identity.turn_id,
++        finalAgentItemId: identity.final_agent_item_id, egressAuthorized: false });
++      return decision;
++    } catch (error) {
++      return deny(String(error?.message ?? error));
++    }
++  }
++
+   async function playNativeOutput(value) {
+     const scope = scopeOf(value), record = find(scope);
+     if (!record || !active(record) || record.state !== 'READY_MUTED' || !record.mutedAck) return { status: 'REJECTED_NOT_MUTED', scope };
+@@ -224,5 +268,5 @@ export function createNativeVoiceBoundary({ adapter, timeoutMs = 1000 } = {}) {
+     return Object.freeze({ scope: record.scope, state: record.state, isCurrent: active(record), jobGeneration: record.jobGeneration, outputMutedConfirmed: Boolean(record.mutedAck), pendingOnsets: record.pendingOnsets, seenOnsets: record.seenOnsets.size, errors: [...record.errors], composer: record.composer, adapterKind: adapter.kind });
+   }
+ 
+-  return Object.freeze({ beginSession, playNativeOutput, speechOnset, closeVoice, gateVaiJob, snapshot, events: () => copy(journal) });
++  return Object.freeze({ beginSession, playNativeOutput, speechOnset, closeVoice, gateVaiJob, authorizeVaiPlayback, snapshot, events: () => copy(journal) });
+ }
+diff --git a/fdv/native-boundary/playback-evidence.mjs b/fdv/native-boundary/playback-evidence.mjs
+new file mode 100644
+index 0000000000000000000000000000000000000000..957f9887c0f38cf3fd5166330fde0f2e8090def0
+--- /dev/null
++++ b/fdv/native-boundary/playback-evidence.mjs
+@@ -0,0 +1,69 @@
++// Structural verifier for a trusted producer readback, not an authentication layer.
++// It cannot release audio alone; live session and local fences belong to index.mjs.
++import { createHash } from 'node:crypto';
++import { readFileSync } from 'node:fs';
++
++const FREEZE_SHA = '7a7c48d0c9d67b4f1e281306264b40e240d7c51e380a5cff6ec0aaf0df624bcb';
++const hash = value => createHash('sha256').update(value).digest('hex');
++const rawFreeze = readFileSync(new URL('../producer/historical_freeze.json', import.meta.url));
++if (hash(rawFreeze) !== FREEZE_SHA) throw new Error('HISTORICAL_FREEZE_SHA_MISMATCH_STOP');
++const freeze = JSON.parse(rawFreeze);
++const frozen = new Set(freeze.records.map(x => JSON.stringify([x.thread_id, x.turn_id])));
++if (freeze.schema !== 'fdv.historical.freeze.v1' || freeze.count !== 93 || frozen.size !== 93 || freeze.records.length !== 93) throw new Error('HISTORICAL_FREEZE_INVALID_STOP');
++
++function canonical(value) {
++  if (value === null || typeof value === 'string' || typeof value === 'boolean') return JSON.stringify(value);
++  if (typeof value === 'number' && Number.isSafeInteger(value)) return JSON.stringify(value);
++  if (Array.isArray(value)) return `[${value.map(canonical).join(',')}]`;
++  if (value && Object.getPrototypeOf(value) === Object.prototype) {
++    return `{${Object.keys(value).sort().map(k => `${JSON.stringify(k)}:${canonical(value[k])}`).join(',')}}`;
++  }
++  throw new Error('NON_CANONICAL_PROOF');
++}
++const nonempty = x => typeof x === 'string' && x.trim().length > 0;
++const sha = x => typeof x === 'string' && /^[a-f0-9]{64}$/.test(x);
++const integer = (x, minimum) => Number.isSafeInteger(x) && x >= minimum;
++function requireThat(condition, reason) { if (!condition) throw new Error(reason); }
++
++export function verifyPlaybackEvidence(evidence) {
++  requireThat(evidence?.schema === 'fdv.voice.playback.evidence.v1'
++    && evidence.provenance_only === true && evidence.egress_authorized === false, 'PRODUCER_EVIDENCE_REQUIRED');
++  const p = evidence.identity, s = evidence.source, r = evidence.admission_receipt;
++  const a = evidence.authorization, j = evidence.journal;
++  requireThat(p && s && r && a && j, 'PROOF_COMPONENT_MISSING');
++  for (const field of ['thread_id', 'native_session_id', 'origin_id', 'client_id', 'queued_item_id', 'turn_id', 'final_agent_item_id', 'first_user_item_id']) {
++    requireThat(nonempty(p[field]), `INVALID_${field}`);
++  }
++  requireThat(!frozen.has(JSON.stringify([p.thread_id, p.turn_id])), 'HISTORICAL_TURN_PERMANENT_HOLD');
++  requireThat(integer(p.voice_session_generation, 1) && integer(p.job_generation, 0), 'INVALID_GENERATION');
++  requireThat(r.schema === 'fdv.voice.admission.v1' && r.admission_result === 'Started'
++    && r.receipt_id === p.queued_item_id && r.turn_id === p.turn_id, 'ADMISSION_RECEIPT_NOT_STARTED_OR_WRONG_TURN');
++  requireThat(a.schema === 'fdv.voice.authorization.v1' && a.state === 'Active', 'AUTHORIZATION_NOT_ACTIVE');
++  for (const field of ['thread_id', 'native_session_id', 'voice_session_generation', 'origin_id', 'client_id', 'queued_item_id']) {
++    requireThat(r[field] === p[field] && a[field] === p[field], `IDENTITY_MISMATCH_${field}`);
++  }
++  requireThat(p.client_id === p.origin_id && a.job_generation === p.job_generation, 'CLIENT_OR_JOB_GENERATION_MISMATCH');
++  requireThat(Object.hasOwn(r, 'input_digest') && Object.hasOwn(a, 'input_digest')
++    && r.input_digest === a.input_digest && (r.input_digest === null || nonempty(r.input_digest)), 'INPUT_DIGEST_MISMATCH');
++  for (const field of ['handoff_id', 'item_id', 'attempt_id']) {
++    requireThat(r[field] === undefined || r[field] === null || nonempty(r[field]), 'INVALID_OPTIONAL_RECEIPT_ID');
++  }
++  requireThat(sha(evidence.receipt_sha256) && hash(canonical(r)) === evidence.receipt_sha256, 'RECEIPT_SNAPSHOT_CHANGED');
++  requireThat(sha(evidence.authorization_sha256) && hash(canonical(a)) === evidence.authorization_sha256, 'AUTHORIZATION_SNAPSHOT_CHANGED');
++  requireThat(j.status === 'ELIGIBLE_FAKE_ONLY' && j.original_receipt_sha256 === evidence.receipt_sha256, 'JOURNAL_NOT_ELIGIBLE_OR_RECEIPT_CHANGED');
++  for (const field of ['native_session_id', 'voice_session_generation', 'job_generation']) {
++    requireThat(j[field] === p[field], `IMMUTABLE_JOURNAL_MISMATCH_${field}`);
++  }
++  requireThat(sha(s.version_sha256) && j.original_version_sha256 === s.version_sha256
++    && sha(s.text_sha256) && j.text_sha256 === s.text_sha256, 'JOURNAL_SOURCE_VERSION_MISMATCH');
++  requireThat(s.classification === 'BACKEND_FINAL_PROVENANCE_NC' && s.turn_status === 'completed'
++    && s.final_pointer === p.final_agent_item_id && s.final_item_id === p.final_agent_item_id, 'FINAL_POINTER_MISMATCH');
++  const u = s.first_user, final = s.final_item;
++  requireThat(s.first_user_item_id === p.first_user_item_id && u?.valid === true && u.type === 'userMessage'
++    && u.id === p.first_user_item_id && u.client_id === p.client_id, 'FIRST_USER_CLIENT_ID_MISMATCH');
++  requireThat(final?.type === 'agentMessage' && final.id === p.final_agent_item_id
++    && final.phase === 'final_answer' && final.delivery === null
++    && (final.questions === null || (Array.isArray(final.questions) && final.questions.length === 0))
++    && nonempty(final.text) && hash(final.text) === s.text_sha256, 'BACKEND_FINAL_CONTENT_INVALID');
++  return Object.freeze({ ...p, text_sha256: s.text_sha256, receipt_sha256: evidence.receipt_sha256 });
++}
+diff --git a/fdv/native-boundary/run-proof.py b/fdv/native-boundary/run-proof.py
+index 56f84e44ec6bda90a6adf8de6b81d147bfa510af..18adf0a4d3aac63719a892e904c70e822dfe55a8 100644
+--- a/fdv/native-boundary/run-proof.py
++++ b/fdv/native-boundary/run-proof.py
+@@ -1,76 +1,70 @@
+ #!/usr/bin/env python3
+-"""Run only this package's synthetic Node tests and preserve receipts locally."""
++"""Execute boundary and combined-gate suites; never infer coverage from file rc0."""
+ from datetime import datetime, timezone
+ from pathlib import Path
+ import hashlib
+ import json
+ import os
+ import re
+-import shutil
+ import subprocess
+ import uuid
+ 
+ ROOT = Path(__file__).resolve().parent
+-SOURCES = ['index.mjs', 'index.d.ts', 'fake-adapter.mjs', 'test-native-boundary.mjs', 'README.md', 'run-proof.py']
+-
++SOURCES = ['index.mjs', 'index.d.ts', 'fake-adapter.mjs', 'playback-evidence.mjs',
++           'test-native-boundary.mjs', 'test-combined-playback.mjs',
++           'fixtures/PLAYBACK-EVIDENCE-FAKE.json', 'README.md', 'run-proof.py']
+ 
+ def sha(path):
+     return hashlib.sha256(path.read_bytes()).hexdigest()
+ 
+-
+ def main():
+-    node = shutil.which('node')
+-    if node is None:
+-        raise SystemExit('NODE_RUNTIME_UNAVAILABLE')
+-    source_hashes = {name: sha(ROOT / name) for name in SOURCES}
+-    destination = ROOT / ('proof-' + datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ') + '-' + uuid.uuid4().hex[:8])
+-    destination.mkdir(exist_ok=False)
++    before = {name: sha(ROOT / name) for name in SOURCES}
++    out = ROOT / ('proof-' + datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ') + '-' + uuid.uuid4().hex[:8])
++    out.mkdir(exist_ok=False)
+     runs = []
+-
+-    def execute(label, arguments, *, negative=False):
++    def run(label, args, negative=False):
+         env = os.environ.copy()
+-        env.pop('FDV_BOUNDARY_TEST_NEGATIVE', None)
+-        if negative:
+-            env['FDV_BOUNDARY_TEST_NEGATIVE'] = '1'
+-        p = subprocess.run([node, *arguments], cwd=ROOT, env=env, text=True, capture_output=True, timeout=30)
+-        (destination / (label + '.stdout.txt')).write_text(p.stdout)
+-        (destination / (label + '.stderr.txt')).write_text(p.stderr)
+-        entry = {'label': label, 'argv': [node, *arguments], 'negative_control': negative, 'rc': p.returncode}
+-        runs.append(entry)
+-        return p
+-
+-    runtime = execute('runtime', ['--version'])
+-    checks = [execute('syntax-' + name, ['--check', name]) for name in ['index.mjs', 'fake-adapter.mjs', 'test-native-boundary.mjs']]
+-    standard = execute('node-test', ['--test', 'test-native-boundary.mjs'])
+-    detailed = execute('node-test-detailed', ['test-native-boundary.mjs'])
+-    negative = execute('negative-node-test', ['--test', 'test-native-boundary.mjs'], negative=True)
+-    negative_detailed = execute('negative-detailed', ['test-native-boundary.mjs'], negative=True)
+-    tests = re.search(r'^# tests (\d+)$', detailed.stdout, re.M)
+-    passes = re.search(r'^# pass (\d+)$', detailed.stdout, re.M)
+-    fails = re.search(r'^# fail (\d+)$', detailed.stdout, re.M)
+-    executed = int(tests[1]) if tests else 0
+-    unchanged = source_hashes == {name: sha(ROOT / name) for name in SOURCES}
+-    success = all(p.returncode == 0 for p in [runtime, *checks, standard, detailed]) and executed == 30 and passes and int(passes[1]) == 30 and fails and int(fails[1]) == 0 and negative.returncode != 0 and negative_detailed.returncode != 0 and 'INTENTIONAL_NEGATIVE_CONTROL' in negative_detailed.stdout and unchanged
+-    receipt = {
+-        'schema': 'FDV_NATIVE_BOUNDARY_OFFLINE_PROOF_V1',
+-        'created_at': datetime.now(timezone.utc).isoformat(),
+-        'node': runtime.stdout.strip(), 'node_path': node,
+-        'adapter': 'FAKE', 'source_hashes': source_hashes,
+-        'source_unchanged': unchanged, 'runs': runs,
+-        'scenarios_executed': executed,
+-        'offline_boundary_proof': 'PASS' if success else 'FAIL',
+-        'negative_control': 'DETECTED' if negative.returncode and negative_detailed.returncode and 'INTENTIONAL_NEGATIVE_CONTROL' in negative_detailed.stdout else 'FAIL',
+-        'installed_native_hookup': 'NC', 'real_v3_onset': 'NC',
+-        'windows_audio': 'NOT_EXECUTED', 'voice_calls': 0, 'network_calls': 0,
+-        'state_persistence': 'MEMORY_ONLY_NOT_PROVED_ACROSS_RESTART',
+-        'typescript_typecheck': 'NOT_EXECUTED',
+-    }
+-    (destination / 'RECEIPT.json').write_text(json.dumps(receipt, ensure_ascii=False, indent=2) + '\n')
+-    entries = ''.join(f'{sha(p)}  {p.name}\n' for p in sorted(destination.iterdir()) if p.is_file())
+-    (destination / 'SHA256SUMS').write_text(entries)
+-    print(json.dumps({'proof_path': str(destination), 'receipt_sha256': sha(destination / 'RECEIPT.json'), 'OFFLINE_BOUNDARY_PROOF': receipt['offline_boundary_proof'], 'SCENARIOS_EXECUTED': executed, 'NEGATIVE_CONTROL': receipt['negative_control'], 'REAL_NATIVE_HOOKUP': 'NC'}, ensure_ascii=False))
++        for key in ['FDV_BOUNDARY_TEST_NEGATIVE', 'FDV_COMBINED_TEST_NEGATIVE']:
++            env.pop(key, None)
++            if negative:
++                env[key] = '1'
++        result = subprocess.run(['node', *args], cwd=ROOT, env=env, capture_output=True, text=True, timeout=30)
++        (out / (label + '.stdout.txt')).write_text(result.stdout)
++        (out / (label + '.stderr.txt')).write_text(result.stderr)
++        runs.append({'argv': ['node', *args], 'label': label, 'negative_control': negative, 'rc': result.returncode})
++        return result
++    checks = [run('runtime', ['--version'])]
++    for name in SOURCES:
++        if name.endswith('.mjs'):
++            checks.append(run('syntax-' + name, ['--check', name]))
++    suites = []
++    for name in ['test-native-boundary.mjs', 'test-combined-playback.mjs']:
++        standard = run(name + '-runner', ['--test', name])
++        detailed = run(name + '-detailed', [name])
++        negative = run(name + '-negative', ['--test', name], True)
++        negative_detail = run(name + '-negative-detailed', [name], True)
++        counts = {k: int(m[1]) if (m := re.search(r'^# ' + k + r' (\d+)$', detailed.stdout, re.M)) else None
++                  for k in ['tests', 'pass', 'fail', 'skipped', 'cancelled']}
++        good = (standard.returncode == detailed.returncode == 0 and counts == {
++            'tests': 30, 'pass': 30, 'fail': 0, 'skipped': 0, 'cancelled': 0}
++            and negative.returncode != 0 and negative_detail.returncode != 0
++            and 'INTENTIONAL_NEGATIVE_CONTROL' in negative_detail.stdout)
++        suites.append({'file': name, 'counts': counts, 'result': 'PASS' if good else 'FAIL',
++                       'negative_control_detected': negative.returncode != 0 and negative_detail.returncode != 0})
++    unchanged = before == {name: sha(ROOT / name) for name in SOURCES}
++    success = unchanged and all(p.returncode == 0 for p in checks) and all(x['result'] == 'PASS' for x in suites)
++    receipt = {'schema': 'fdv.native.combined.delta.proof.v1', 'result': 'PASS' if success else 'FAIL',
++               'source_hashes': before, 'source_unchanged': unchanged, 'suites': suites, 'runs': runs,
++               'scenarios': sum(s['counts']['tests'] or 0 for s in suites),
++               'runtime': checks[0].stdout.strip(), 'adapter': 'FAKE',
++               'windows': False, 'voice': False, 'elevenlabs': False, 'production': False,
++               'typescript_typecheck': 'PENDING_NEW_DELTA_NOT_EXECUTED',
++               'native_readback_authentication': 'NC_OFFLINE_FAKE_ONLY'}
++    (out / 'RECEIPT.json').write_text(json.dumps(receipt, indent=2) + '\n')
++    (out / 'SHA256SUMS').write_text(''.join(f'{sha(f)}  {f.name}\n' for f in sorted(out.iterdir()) if f.is_file()))
++    print(json.dumps({'result': receipt['result'], 'scenarios': receipt['scenarios'],
++                      'receipt': str(out / 'RECEIPT.json'), 'sha256': sha(out / 'RECEIPT.json')}))
+     raise SystemExit(0 if success else 1)
+ 
+-
+ if __name__ == '__main__':
+     main()
+diff --git a/fdv/native-boundary/test-combined-playback.mjs b/fdv/native-boundary/test-combined-playback.mjs
+new file mode 100644
+index 0000000000000000000000000000000000000000..d19390ac6727a0b900e0ba1f7e9c917ef27cc86d
+--- /dev/null
++++ b/fdv/native-boundary/test-combined-playback.mjs
+@@ -0,0 +1,136 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import { readFileSync } from 'node:fs';
++import { createHash } from 'node:crypto';
++import { createNativeVoiceBoundary } from './index.mjs';
++import { createFakeAdapter } from './fake-adapter.mjs';
++
++const fixture = JSON.parse(readFileSync(new URL('./fixtures/PLAYBACK-EVIDENCE-FAKE.json', import.meta.url)));
++const clone = x => JSON.parse(JSON.stringify(x));
++const packet = () => clone(fixture);
++const scope = p => ({ threadId: p.identity.thread_id, nativeSessionId: p.identity.native_session_id,
++  voiceGeneration: p.identity.voice_session_generation, ownerId: 'COMBINED_FAKE_OWNER' });
++const canonical = x => x && typeof x === 'object' ? Array.isArray(x) ? `[${x.map(canonical).join(',')}]`
++  : `{${Object.keys(x).sort().map(k => `${JSON.stringify(k)}:${canonical(x[k])}`).join(',')}}` : JSON.stringify(x);
++const sha = x => createHash('sha256').update(x).digest('hex');
++const reseal = p => { p.receipt_sha256 = sha(canonical(p.admission_receipt)); p.authorization_sha256 = sha(canonical(p.authorization)); p.journal.original_receipt_sha256 = p.receipt_sha256; return p; };
++const tick = () => new Promise(resolve => setImmediate(resolve));
++const deferred = () => { let resolve; const promise = new Promise(r => { resolve = r; }); return { promise, resolve }; };
++async function bench(overrides = {}) {
++  const p = packet(), s = scope(p), a = createFakeAdapter(overrides), b = createNativeVoiceBoundary({ adapter: a });
++  assert.equal((await b.beginSession(s)).status, 'READY_MUTED');
++  return { p, s, a, b, call: readProducerEvidence => b.authorizeVaiPlayback({ scope: s, readProducerEvidence }) };
++}
++
++test('positive: actual Python source+journal fixture passes only combined five-way gate', async () => {
++  assert.notEqual(process.env.FDV_COMBINED_TEST_NEGATIVE, '1', 'INTENTIONAL_NEGATIVE_CONTROL');
++  const { p, s, a, b, call } = await bench();
++  assert.equal(b.gateVaiJob({ scope: s, jobGeneration: 0 }).finalProvenanceAuthorized, false);
++  const result = await call(() => p);
++  assert.equal(result.status, 'READY_FOR_TTS');
++  for (const key of ['producerProvenance', 'admissionReceipt', 'liveNativeSession', 'boundaryGeneration', 'muteFence']) assert.equal(result[key], 'PASS');
++  assert.equal(result.egressAuthorized, false); assert.equal(result.executionScope, 'OFFLINE_FAKE');
++  assert.deepEqual(a.calls.map(c => c.method), ['setOutputMuted', 'observeLiveSession']);
++  assert.equal(a.playerHandles.size, 0); // Gate did not itself create a player.
++});
++
++for (const field of ['thread_id', 'native_session_id', 'voice_session_generation', 'origin_id', 'client_id', 'turn_id', 'final_agent_item_id', 'job_generation']) {
++  test(`negative: inconsistent ${field} cannot become READY`, async () => {
++    const { p, call } = await bench(); p.identity[field] = typeof p.identity[field] === 'number' ? 99 : 'WRONG';
++    assert.equal((await call(() => p)).status, 'HOLD');
++  });
++}
++test('same thread+generation, consistently wrong native session across packet still denied by live session', async () => {
++  const { p, call } = await bench();
++  for (const obj of [p.identity, p.admission_receipt, p.authorization, p.journal]) obj.native_session_id = 'WRONG_NATIVE_SESSION';
++  reseal(p);
++  const result = await call(() => p);
++  assert.equal(result.status, 'HOLD'); assert.equal(result.reason, 'LIVE_NATIVE_SESSION_IDENTITY_MISMATCH');
++});
++
++for (const mutate of [
++  p => { p.authorization.state = 'Closed'; reseal(p); },
++  p => { p.admission_receipt.admission_result = 'Queued'; reseal(p); },
++  p => { p.source.first_user.client_id = 'wrong-client'; },
++  p => { p.source.final_item.text += 'tampered'; },
++  p => { p.source.final_item.phase = 'commentary'; },
++  p => { p.source.final_pointer = 'another-final'; },
++  p => { p.journal.status = 'HOLD_NC_PROVENANCE'; },
++  p => { p.journal.original_version_sha256 = 'a'.repeat(64); },
++  p => { p.journal.job_generation = 1; },
++  p => { delete p.admission_receipt.native_session_id; reseal(p); },
++]) {
++  test(`negative: producer/source/journal mutation ${mutate.toString()}`, async () => {
++    const { p, call } = await bench(); mutate(p); assert.equal((await call(() => p)).status, 'HOLD');
++  });
++}
++
++for (const field of ['active', 'ownerCurrent', 'outputMuted']) {
++  test(`negative live readback ${field}=false`, async () => {
++    const { p, call } = await bench({ observeLiveSession: async (r, a, ack) => ack(r, 'LIVE_SESSION_ACK', {
++      active: true, ownerCurrent: true, outputMuted: true, observation: 'SESSION_AND_SINK_READBACK', [field]: false }) });
++    assert.equal((await call(() => p)).status, 'HOLD');
++  });
++}
++test('no mute ACK means no live read and no combined readiness', async () => {
++  const d = deferred(), p = packet(), s = scope(p), a = createFakeAdapter({ setOutputMuted: async (r, a, ack) => {
++    await d.promise; return ack(r, 'OUTPUT_MUTED_ACK', { muted: true, observation: 'SINK_READBACK' });
++  } });
++  const b = createNativeVoiceBoundary({ adapter: a }), begin = b.beginSession(s);
++  assert.equal((await b.authorizeVaiPlayback({ scope: s, readProducerEvidence: () => p })).status, 'HOLD');
++  assert.equal(a.calls.filter(c => c.method === 'observeLiveSession').length, 0);
++  d.resolve(); await begin;
++});
++test('onset during live readback fences old job and late callback; duplicate onset does not renew it', async () => {
++  const d = deferred();
++  const { p, s, b, call } = await bench({ observeLiveSession: async (r, a, ack) => {
++    await d.promise; return ack(r, 'LIVE_SESSION_ACK', { active: true, ownerCurrent: true, outputMuted: true, observation: 'SESSION_AND_SINK_READBACK' });
++  } });
++  const pending = call(() => p); await tick();
++  const event = { scope: s, eventId: 'ONSET', origin: 'FAKE_FIXTURE' };
++  await b.speechOnset(event); const generation = b.snapshot(s).jobGeneration;
++  await b.speechOnset(event); assert.equal(b.snapshot(s).jobGeneration, generation);
++  d.resolve(); assert.equal((await pending).status, 'HOLD');
++  assert.equal((await call(() => p)).status, 'HOLD');
++});
++test('close and successor during pending live ACK cannot authorize predecessor', async () => {
++  const d = deferred();
++  const { p, s, b, call } = await bench({ observeLiveSession: async (r, a, ack) => {
++    await d.promise; return ack(r, 'LIVE_SESSION_ACK', { active: true, ownerCurrent: true, outputMuted: true, observation: 'SESSION_AND_SINK_READBACK' });
++  } });
++  const pending = call(() => p); await tick(); await b.closeVoice(s);
++  const next = { ...s, voiceGeneration: s.voiceGeneration + 1, nativeSessionId: 'SUCCESSOR' };
++  await b.beginSession(next); d.resolve(); assert.equal((await pending).status, 'HOLD');
++  assert.equal(b.snapshot(next).state, 'READY_MUTED');
++});
++test('read current producer AFTER native await: revocation before reader returns HOLD', async () => {
++  const d = deferred();
++  const { p, call } = await bench({ observeLiveSession: async (r, a, ack) => {
++    await d.promise; return ack(r, 'LIVE_SESSION_ACK', { active: true, ownerCurrent: true, outputMuted: true, observation: 'SESSION_AND_SINK_READBACK' });
++  } });
++  let current = p; const pending = call(() => current); await tick(); current = { status: 'PASS' };
++  d.resolve(); assert.equal((await pending).status, 'HOLD');
++});
++test('reentrant reader triggering onset is checked again before readiness', async () => {
++  const { p, s, b, call } = await bench(); let onset;
++  assert.equal((await call(() => { onset = b.speechOnset({ scope: s, eventId: 'reentrant', origin: 'FAKE_FIXTURE' }); return p; })).status, 'HOLD');
++  await onset;
++});
++test('bare PASS, async reader and absent reader never authorize alone', async () => {
++  const { p, call, b, s } = await bench();
++  assert.equal((await call(() => ({ status: 'PASS' }))).status, 'HOLD');
++  assert.equal((await call(async () => p)).status, 'HOLD');
++  assert.equal((await call(async () => { throw new Error('REJECTED_ASYNC_READER'); })).status, 'HOLD');
++  await tick(); // A rejected invalid reader must not become an unhandled rejection.
++  assert.equal((await b.authorizeVaiPlayback({ scope: s })).status, 'HOLD');
++});
++test('all 93 historical identities denied again by combined gate', async () => {
++  const freeze = JSON.parse(readFileSync(new URL('../producer/historical_freeze.json', import.meta.url)));
++  const { p, call } = await bench(); let denied = 0;
++  for (const row of freeze.records) {
++    const old = clone(p); old.identity.thread_id = row.thread_id; old.identity.turn_id = row.turn_id;
++    const result = await call(() => old);
++    assert.equal(result.reason, 'HISTORICAL_TURN_PERMANENT_HOLD'); denied++;
++  }
++  assert.equal(denied, 93);
++});
+diff --git a/fdv/producer/ADMISSION-CONTRACT.md b/fdv/producer/ADMISSION-CONTRACT.md
+index 31bc8d9169f34c5f12fea1a565db96208707d541..387c47407a4a2a3ed4f900f0158939b118cc6640 100644
+--- a/fdv/producer/ADMISSION-CONTRACT.md
++++ b/fdv/producer/ADMISSION-CONTRACT.md
+@@ -1,12 +1,13 @@
+ # Producer admission gate — offline candidate
+ 
+ This directory evolves a COPY of the previously reviewed producer. The original
+-package and its real 93-job journal are unchanged. `final_producer_base.py` is the
++package and its real 93-job journal are unchanged. This delta does not reopen
++either source; the exact historical freeze SHA remains unchanged. `final_producer_base.py` is the
+ preserved starting source; it is not the active gate implementation.
+ 
+ ## Result and scope
+ 
+-- Admission suite: **PASS, 199 assertions / 14 scenarios**.
++- Admission suite: **PASS, 239 assertions / 19 scenarios**.
+ - Existing SQLite regression: **PASS, 70 assertions / 14 scenarios**, including
+   four real benign Linux subprocesses and cache-spill rollback recovery.
+ - Windows, real Voice, TTS, audio, network and Codex RPC executions: **zero**.
+@@ -45,6 +46,7 @@ authenticate a real origin, owner or live session.
+   "schema": "fdv.voice.admission.v1",
+   "receipt_id": "opaque-queue-id",
+   "thread_id": "thread-id",
++  "native_session_id": "native-session-id",
+   "voice_session_generation": 1,
+   "origin_id": "opaque-origin-id",
+   "handoff_id": null,
+@@ -76,7 +78,9 @@ user item never authorizes a replay or requeue.
+ {
+   "schema": "fdv.voice.authorization.v1",
+   "state": "Active",
++  "job_generation": 0,
+   "thread_id": "thread-id",
++  "native_session_id": "native-session-id",
+   "voice_session_generation": 1,
+   "origin_id": "opaque-origin-id",
+   "client_id": "opaque-origin-id",
+@@ -86,8 +90,10 @@ user item never authorizes a replay or requeue.
+ ```
+ 
+ This is a per-job snapshot of the caller's CURRENT session authorization.
+-Generation must be an integer at least one; booleans and stringified numbers
+-are rejected. Thread, generation, origin, client, queue ID and input digest must
++Voice generation must be a JavaScript-safe integer at least one; job generation
++must be a JavaScript-safe integer at least zero. Booleans/stringified numbers
++are rejected. Native session ID is required; absence is not a wildcard. Thread,
++native session, voice generation, origin, client, queue ID and input digest must
+ match the receipt exactly. Inactive or absent authorization causes HOLD even
+ after a previous eligible poll.
+ 
+@@ -113,13 +119,61 @@ duplicate JSON keys, absent/null/invalid IDs and mismatched pointers HOLD. The
+ measured real projection uses `clientId`; the observation is documented separately.
+ The presence of a client ID alone never establishes a Voice origin.
+ 
+-`admission_audit` persists the first positive generation and receipt hash in the
+-same candidate journal transaction as the job decision. A later authorization
+-generation cannot rebind that old job; a changed committed receipt cannot
++`admission_audit` persists the first positive native session, voice generation,
++job generation and receipt hash in the same candidate journal transaction as
++the job decision. A later authorization
++voice generation cannot rebind that old job. A matching receipt/authorization
++rewritten for another native session is also held. Advancing authorization
++job_generation after speech onset cannot refresh an old final; a changed committed receipt cannot
+ silently replace its first proof. Current authorization is checked on every poll.
+ Revocation concurrent with a later renderer operation still requires the
+ renderer/consumer's own immediate authorization recheck.
+ 
++## Combined-gate evidence, never isolated producer authorization
++
++```python
++read_playback_evidence(source_path, thread_id, journal_path,
++                      (thread_id, turn_id, final_agent_item_id),
++                      admission_receipts=[receipt], authorization=authorization)
++```
++
++This additional entry point is read-only. It requires an already committed,
++owned v3 candidate journal job and its immutable first-generation audit. It
++rereads current source rows; source disappearance/change or a persistent journal
++HOLD cannot be bypassed by supplying a plausible receipt. It does not create a
++job, update eligibility or repair a journal. `build_playback_evidence` is the pure
++validator used after that reader enriches a record; arbitrary caller dictionaries
++remain trusted-input contracts, not authenticated evidence.
++
++Returned schema `fdv.voice.playback.evidence.v1` contains:
++
++- `identity`: thread/native session/voice generation/origin/client/queue/turn/
++  final item/first user item/job generation.
++- `source`: final pointer and final item, exact first user evidence, source
++  version hash and text hash. The final text remains intact for future TTS.
++- `journal`: eligible fake status, original source version and text hash,
++  immutable native/voice/job generations and original receipt hash.
++- Full matched `admission_receipt` and `authorization` snapshots, their exact
++  canonical SHA256s, `provenance_only=true`, `egress_authorized=false`.
++
++Canonical hashing uses UTF-8 `json.dumps(ensure_ascii=False, sort_keys=True,
++separators=(',', ':'))`. Packets must remain private when they contain real final
++text. The packaged fixture contains exclusively synthetic text. A detached JSON
++copy prevents later caller mutation from changing a captured packet; it does
++not turn the packet into current authority.
++
++The root-owned `authorizeVaiPlayback` must call a trusted evidence reader at the
++play boundary, revalidate all packet identities/hashes, and combine them with
++actual current native session, owner, generation and mute fences. The real
++authorization producer must retain the job generation assigned to each origin;
++it cannot stamp the newest boundary generation onto an old final that arrives
++after an onset. Freezing generation at first eligibility alone does not prove
++that upstream origin-to-generation assignment. That live assignment is **NC**. Neither a
++producer packet nor a boundary-only success authorizes playback. The trusted
++live authorization source, native adapter and cross-process transport remain
++**NC**, not proved by these offline tests. These APIs do not promise atomicity
++across SQLite, JavaScript and a future player. No TTS/audio is invoked here.
++
+ ## Historical freeze and source changes
+ 
+ `historical_freeze.json` contains only 93 historical thread/turn/item identities
+@@ -137,8 +191,9 @@ Source disappearance removes eligibility from both jobs and the audit record.
+ The final text, including literal `[COMPLETE]`, is never stripped or normalized.
+ This is not proof of semantic envelope interpretation.
+ 
+-The candidate journal schema is v2. It does not migrate the original private v1
+-journal. The previous journal recovery guards remain candidate-file-only and
++The delta candidate journal schema is v3. It does not migrate the original
++private v1 journal or the previous candidate v2 journal. Old journals fail the
++binding check rather than silently gaining playback authorization. The previous journal recovery guards remain candidate-file-only and
+ cooperative under the same UID; they are not protection against a malicious
+ same-UID writer, general power-failure recovery or a production authority layer.
+ 
+diff --git a/fdv/producer/ADMISSION-SHA256SUMS.json b/fdv/producer/ADMISSION-SHA256SUMS.json
+index 5ecbd1f62a4606e772d8bea7cb97351c7ee28d53..a3228223ad0ce418c6192ab931af2b9f12099bf6 100644
+--- a/fdv/producer/ADMISSION-SHA256SUMS.json
++++ b/fdv/producer/ADMISSION-SHA256SUMS.json
+@@ -6,8 +6,8 @@
+   "files": [
+     {
+       "name": "ADMISSION-CONTRACT.md",
+-      "sha256": "c770fd701f3407268594a31d3544a6847c0e3a06b78f464f8ca4d115e3bad883",
+-      "bytes": 7224
++      "sha256": "b4efa548ab3aa75217b1ed69f5d5c862407fe3449ce3d7f472488a96adbc83b4",
++      "bytes": 10621
+     },
+     {
+       "name": "CLIENT-ID-SHAPE-OBSERVATION.json",
+@@ -21,13 +21,13 @@
+     },
+     {
+       "name": "admission_gate.py",
+-      "sha256": "a7b0718ea9d042c3029d7cbdf0a791883256d22a2efb3b673249413f2ad55943",
+-      "bytes": 7806
++      "sha256": "4c77f1b702e188da3b9ebda6f1070e716ebbd23191f37f83e2d35f08b4b9b9a9",
++      "bytes": 12731
+     },
+     {
+       "name": "final_producer.py",
+-      "sha256": "7843d6e3bf51c9a903f43c81d16f01363622f231c7229b3f023d7e4875e8e689",
+-      "bytes": 22101
++      "sha256": "0d3ce21e8dee2e8431ad8df33e8cdef906b73c733175aa4661e9a8759b7599f1",
++      "bytes": 25003
+     },
+     {
+       "name": "final_producer_base.py",
+@@ -46,8 +46,8 @@
+     },
+     {
+       "name": "test_admission.py",
+-      "sha256": "0ba5f4ee098405cc954f3868abb53e920f0a5a7651e267c6dcf83a9d05aefecd",
+-      "bytes": 16883
++      "sha256": "e3a9733dd7e00c08f315a4b093cd654b5e56e7949b2b0456909688f8dd510918",
++      "bytes": 23859
+     },
+     {
+       "name": "test_producer.py",
+@@ -60,13 +60,18 @@
+       "bytes": 1717
+     },
+     {
+-      "name": "admission-tests-4e11c4ed665b4ed0b59237b7eb1d07a2/TEST-RECEIPT.json",
+-      "sha256": "a7b4ae1984b107ebaa7af6ae57536d6704e21f49530d7e9c5975cef96713da47",
+-      "bytes": 2960
++      "name": "admission-tests-fbee3f21ea9c4b3ea68b81f2af45fe44/TEST-RECEIPT.json",
++      "sha256": "f3d5f591161437ac66c6b89f5f29eaf9aff53d97083bbbbba6273cdfe4b6096b",
++      "bytes": 3710
+     },
+     {
+-      "name": "tests-5b3bf7a0501e4e92a565c5aea9797f0a/TEST-RECEIPT.json",
+-      "sha256": "8be7abe6ed49d3215b47889bdf735668d322cceceb7b9c61318cee1c55f570bb",
++      "name": "admission-tests-fbee3f21ea9c4b3ea68b81f2af45fe44/PLAYBACK-EVIDENCE-FAKE.json",
++      "sha256": "204bc9c907beb7dcf504e1af95a1cc1fd29ed4b1db275157e19f850d25556d91",
++      "bytes": 2905
++    },
++    {
++      "name": "tests-f329ba74454a4c2c923683b4bd6df5f5/TEST-RECEIPT.json",
++      "sha256": "930fba4ce73b2daf74791a2d99c8569e5a5e313551d8bd8f944435c188ff2226",
+       "bytes": 2830
+     }
+   ]
+diff --git a/fdv/producer/admission_gate.py b/fdv/producer/admission_gate.py
+index 9fb7fae006d728fd0d7e1cfbed11f97308a08865..9b45c6a65d545677a7fc23ceef569ec7cfd3db9b 100644
+--- a/fdv/producer/admission_gate.py
++++ b/fdv/producer/admission_gate.py
+@@ -11,7 +11,7 @@ from pathlib import Path
+ 
+ ROOT = Path(__file__).resolve().parent
+ FREEZE_SHA256 = '7a7c48d0c9d67b4f1e281306264b40e240d7c51e380a5cff6ec0aaf0df624bcb'
+-MATCH_FIELDS = ('thread_id', 'voice_session_generation', 'origin_id',
++MATCH_FIELDS = ('thread_id', 'native_session_id', 'voice_session_generation', 'origin_id',
+                 'client_id', 'queued_item_id', 'input_digest')
+ RECEIPT_REQUIRED = ('schema', 'receipt_id', *MATCH_FIELDS,
+                     'turn_id', 'admission_result')
+@@ -57,12 +57,18 @@ def verdict(status, reason, receipt=None, authorization=None):
+             'receipt_sha256': digest(receipt) if receipt is not None else None,
+             'authorization_sha256': digest(authorization) if authorization is not None else None,
+             'voice_session_generation': receipt.get('voice_session_generation') if receipt else None,
++            'native_session_id': receipt.get('native_session_id') if receipt else None,
++            'job_generation': authorization.get('job_generation') if authorization else None,
+             'origin_id': receipt.get('origin_id') if receipt else None,
+             'queued_item_id': receipt.get('queued_item_id') if receipt else None}
+ 
+ 
+ def valid_generation(value):
+-    return type(value) is int and value >= 1
++    return type(value) is int and 1 <= value <= 9007199254740991
++
++
++def valid_job_generation(value):
++    return type(value) is int and 0 <= value <= 9007199254740991
+ 
+ 
+ def evaluate_final_admission(record, receipts, authorization):
+@@ -102,19 +108,28 @@ def evaluate_final_admission(record, receipts, authorization):
+             or authorization.get('state') != 'Active'
+             or any(k not in authorization for k in MATCH_FIELDS)
+             or not valid_generation(authorization.get('voice_session_generation'))
++            or not valid_job_generation(authorization.get('job_generation'))
+             or any(not nonempty(authorization.get(k)) for k in
+-                   ('thread_id', 'origin_id', 'client_id', 'queued_item_id'))
++                   ('thread_id', 'native_session_id', 'origin_id', 'client_id', 'queued_item_id'))
+             or authorization['client_id'] != authorization['origin_id']
+             or (authorization['input_digest'] is not None
+                 and not nonempty(authorization['input_digest']))):
+         return verdict('HOLD_NC_PROVENANCE', 'AUTHORIZATION_INACTIVE_OR_INVALID')
+     if authorization['thread_id'] != thread:
+         return verdict('HOLD_NC_PROVENANCE', 'AUTHORIZATION_THREAD_MISMATCH')
+-    job_generation = record.get('job_voice_session_generation')
+-    if job_generation is not None and (
+-            not valid_generation(job_generation)
+-            or job_generation != authorization['voice_session_generation']):
++    voice_generation = record.get('job_voice_session_generation')
++    if voice_generation is not None and (
++            not valid_generation(voice_generation)
++            or voice_generation != authorization['voice_session_generation']):
+         return verdict('HOLD_NC_PROVENANCE', 'JOB_GENERATION_SNAPSHOT_MISMATCH')
++    native_session = record.get('job_native_session_id')
++    if native_session is not None and native_session != authorization['native_session_id']:
++        return verdict('HOLD_NC_PROVENANCE', 'JOB_NATIVE_SESSION_SNAPSHOT_MISMATCH')
++    job_generation = record.get('job_generation')
++    if job_generation is not None and (
++            not valid_job_generation(job_generation)
++            or job_generation != authorization['job_generation']):
++        return verdict('HOLD_NC_PROVENANCE', 'JOB_PLAYBACK_GENERATION_SNAPSHOT_MISMATCH')
+     if not isinstance(receipts, (list, tuple)):
+         return verdict('HOLD_NC_PROVENANCE', 'RECEIPT_SNAPSHOT_REQUIRED')
+     relevant = [r for r in receipts if isinstance(r, dict)
+@@ -129,7 +144,7 @@ def evaluate_final_admission(record, receipts, authorization):
+             or receipt.get('receipt_id') != receipt.get('queued_item_id')
+             or not valid_generation(receipt.get('voice_session_generation'))
+             or any(not nonempty(receipt.get(k)) for k in
+-                   ('receipt_id', 'thread_id', 'origin_id', 'client_id', 'queued_item_id'))
++                   ('receipt_id', 'thread_id', 'native_session_id', 'origin_id', 'client_id', 'queued_item_id'))
+             or receipt.get('client_id') != receipt.get('origin_id')
+             or any(receipt.get(k) is not None and not nonempty(receipt[k])
+                    for k in ('handoff_id', 'item_id', 'attempt_id'))
+@@ -149,3 +164,70 @@ def evaluate_final_admission(record, receipts, authorization):
+         return verdict('HOLD_NC_PROVENANCE', 'COMMITTED_ADMISSION_RECEIPT_CHANGED')
+     return verdict('ELIGIBLE_FAKE_ONLY', 'EXACT_RECEIPT_AUTHORIZATION_AND_SQL_JOIN',
+                    receipt, authorization)
++
++
++
++def build_playback_evidence(record, receipts, authorization):
++    """Produce a provenance packet, never permission to synthesize/play.
++
++    Caller must supply a record enriched from the exact owned candidate journal
++    through final_producer.read_playback_evidence. Fields are rechecked rather
++    than trusting a pass boolean. A dictionary is not an authenticated capability:
++    the combined native gate must independently inspect current session/fences.
++    """
++    decision = evaluate_final_admission(record, receipts, authorization)
++    if not decision['eligible_fake_only']:
++        raise ValueError('PLAYBACK_EVIDENCE_HOLD:' + decision['reason'])
++    if (record.get('journal_status') != 'ELIGIBLE_FAKE_ONLY'
++            or record.get('job_native_session_id') != authorization['native_session_id']
++            or record.get('job_voice_session_generation') != authorization['voice_session_generation']
++            or record.get('job_generation') != authorization['job_generation']
++            or record.get('job_receipt_sha256') != decision['receipt_sha256']
++            or record.get('journal_original_version_sha256') != record.get('version_sha256')
++            or record.get('journal_text_sha256') != record.get('text_sha256')):
++        raise ValueError('PLAYBACK_EVIDENCE_HOLD:IMMUTABLE_JOURNAL_PROOF_REQUIRED')
++    receipt = next(r for r in receipts if r.get('queued_item_id') == authorization['queued_item_id'])
++    final = json.loads(record['item_json'])
++    text = final.get('text')
++    if (not isinstance(text, str) or not text.strip()
++            or hashlib.sha256(text.encode('utf-8')).hexdigest() != record['text_sha256']):
++        raise ValueError('PLAYBACK_EVIDENCE_HOLD:TEXT_HASH_MISMATCH')
++    thread, turn, item_id = record['identity']
++    packet = {
++        'schema': 'fdv.voice.playback.evidence.v1',
++        'identity': {
++            'thread_id': thread, 'native_session_id': receipt['native_session_id'],
++            'voice_session_generation': receipt['voice_session_generation'],
++            'origin_id': receipt['origin_id'], 'client_id': receipt['client_id'],
++            'queued_item_id': receipt['queued_item_id'], 'turn_id': turn,
++            'final_agent_item_id': item_id,
++            'first_user_item_id': record['first_user_item_id'],
++            'job_generation': record['job_generation'],
++        },
++        'source': {
++            'classification': record['classification'], 'turn_status': 'completed',
++            'final_pointer': record['final_pointer'], 'final_item_id': record['final_item_id'],
++            'final_item': {**{k: final[k] for k in ('id', 'type', 'text', 'phase', 'delivery')},
++                           'questions': final.get('questions')},
++            'first_user_item_id': record['first_user_item_id'],
++            'first_user': record['first_user'],
++            'version_sha256': record['version_sha256'], 'text_sha256': record['text_sha256'],
++        },
++        'journal': {
++            'status': record['journal_status'],
++            'original_version_sha256': record['journal_original_version_sha256'],
++            'text_sha256': record['journal_text_sha256'],
++            'native_session_id': record['job_native_session_id'],
++            'voice_session_generation': record['job_voice_session_generation'],
++            'job_generation': record['job_generation'],
++            'original_receipt_sha256': record['job_receipt_sha256'],
++        },
++        'admission_receipt': receipt, 'authorization': authorization,
++        'receipt_sha256': decision['receipt_sha256'],
++        'authorization_sha256': decision['authorization_sha256'],
++        'provenance_only': True, 'egress_authorized': False,
++        'source_payload_digest_verified': False,
++    }
++    # Detached serialized value: later mutation of caller inputs cannot rewrite
++    # this already captured packet. It is still a snapshot, not live authority.
++    return json.loads(json.dumps(packet, ensure_ascii=False))
+diff --git a/fdv/producer/final_producer.py b/fdv/producer/final_producer.py
+index 4a74263abab215682803612ba858e00b6a59ce4b..5eb9a42eb5e9c1722e20cb61a5b41874ed8f7580 100644
+--- a/fdv/producer/final_producer.py
++++ b/fdv/producer/final_producer.py
+@@ -17,9 +17,9 @@ import stat
+ import uuid
+ 
+ if __package__:
+-    from .admission_gate import evaluate_final_admission, frozen_turns, is_frozen
++    from .admission_gate import build_playback_evidence, evaluate_final_admission, frozen_turns, is_frozen
+ else:
+-    from admission_gate import evaluate_final_admission, frozen_turns, is_frozen
++    from admission_gate import build_playback_evidence, evaluate_final_admission, frozen_turns, is_frozen
+ 
+ ROOT = Path(__file__).resolve().parent
+ SQL = '''SELECT t.thread_id,t.turn_id,t.final_agent_item_id,
+@@ -57,6 +57,7 @@ CREATE TABLE jobs(
+ CREATE TABLE admission_audit(
+  thread_id TEXT NOT NULL,turn_id TEXT NOT NULL,item_id TEXT NOT NULL,
+  generation_snapshot INTEGER,original_receipt_sha256 TEXT,
++ native_session_snapshot TEXT,job_generation_snapshot INTEGER,
+  latest_decision_json TEXT NOT NULL,last_poll TEXT NOT NULL,
+  PRIMARY KEY(thread_id,turn_id,item_id));
+ '''
+@@ -188,7 +189,7 @@ def read_snapshot(source_path, thread_id):
+ 
+ 
+ def expected_binding(source_path, thread_id, schema_hash):
+-    return {'schema': 'fdv.candidate.final.capture.journal.v2',
++    return {'schema': 'fdv.candidate.final.capture.journal.v3',
+             'source_path': str(Path(source_path).resolve(strict=True)),
+             'thread_id': thread_id, 'source_schema_sha256': schema_hash,
+             'egress': 'DISABLED_REAL_EGRESS_ELIGIBILITY_IS_FAKE_ONLY'}
+@@ -296,12 +297,14 @@ def poll_once(source_path, thread_id, journal_path, _test_hook=None,
+                       (run_id, *key, r['version_sha256']))
+             existing = c.execute('''SELECT original_version_sha256,status FROM jobs
+                  WHERE thread_id=? AND turn_id=? AND item_id=?''', key).fetchone()
+-            prior = c.execute('''SELECT generation_snapshot,original_receipt_sha256
+-              FROM admission_audit WHERE thread_id=? AND turn_id=? AND item_id=?''', key).fetchone()
++            prior = c.execute('''SELECT generation_snapshot,original_receipt_sha256,
++              native_session_snapshot,job_generation_snapshot FROM admission_audit WHERE thread_id=? AND turn_id=? AND item_id=?''', key).fetchone()
+             scoped_record = dict(r)
+             if prior is not None:
+                 scoped_record['job_voice_session_generation'] = prior[0]
+                 scoped_record['job_receipt_sha256'] = prior[1]
++                scoped_record['job_native_session_id'] = prior[2]
++                scoped_record['job_generation'] = prior[3]
+             decision = evaluate_final_admission(scoped_record, admission_receipts, authorization)
+             status = decision['status']
+             if existing is not None:
+@@ -327,16 +330,22 @@ def poll_once(source_path, thread_id, journal_path, _test_hook=None,
+                                     reason='SOURCE_HISTORY_OR_CONFLICT_OVERRIDES_RECEIPT')
+                 generation = prior[0] if prior else None
+                 receipt_sha = prior[1] if prior else None
++                native_session = prior[2] if prior else None
++                job_generation = prior[3] if prior else None
+                 if decision['eligible_fake_only'] and generation is None:
+                     generation = decision['voice_session_generation']
+                     receipt_sha = decision['receipt_sha256']
+-                c.execute('''INSERT INTO admission_audit VALUES(?,?,?,?,?,?,?)
++                    native_session = decision['native_session_id']
++                    job_generation = decision['job_generation']
++                c.execute('''INSERT INTO admission_audit VALUES(?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT(thread_id,turn_id,item_id) DO UPDATE SET
+                   latest_decision_json=excluded.latest_decision_json,
+                   last_poll=excluded.last_poll,
+                   generation_snapshot=COALESCE(admission_audit.generation_snapshot,excluded.generation_snapshot),
+-                  original_receipt_sha256=COALESCE(admission_audit.original_receipt_sha256,excluded.original_receipt_sha256)''',
+-                          (*key, generation, receipt_sha, canonical(decision), run_id))
++                  original_receipt_sha256=COALESCE(admission_audit.original_receipt_sha256,excluded.original_receipt_sha256),
++                  native_session_snapshot=COALESCE(admission_audit.native_session_snapshot,excluded.native_session_snapshot),
++                  job_generation_snapshot=COALESCE(admission_audit.job_generation_snapshot,excluded.job_generation_snapshot)''',
++                          (*key, generation, receipt_sha, native_session, job_generation, canonical(decision), run_id))
+         for key in c.execute('SELECT thread_id,turn_id,item_id FROM jobs').fetchall():
+             if tuple(key) not in seen:
+                 c.execute('''UPDATE jobs SET status='HOLD_SOURCE_UNAVAILABLE'
+@@ -386,6 +395,46 @@ def poll_once(source_path, thread_id, journal_path, _test_hook=None,
+             'windows_assertions': 0}
+ 
+ 
++
++def read_playback_evidence(source_path, thread_id, journal_path, identity,
++                           *, admission_receipts, authorization):
++    """Read current source + owned candidate journal, return provenance only.
++
++    Does not mutate the journal, repair missing rows, refresh a job generation,
++    or emit audio. A later live combined gate is mandatory before future TTS.
++    """
++    identity = tuple(identity)
++    if len(identity) != 3 or identity[0] != thread_id:
++        raise ValueError('PLAYBACK_IDENTITY_THREAD_MISMATCH')
++    snapshot = read_snapshot(source_path, thread_id)
++    matches = [r for r in snapshot['records'] if r['identity'] == identity]
++    if len(matches) != 1:
++        raise ValueError('PLAYBACK_CURRENT_SOURCE_NOT_UNIQUE')
++    binding = expected_binding(source_path, thread_id, snapshot['schema_sha256'])
++    journal_path = local_output(journal_path)
++    verify_ownership_proof(journal_path, binding)
++    if journal_metadata(journal_path, read_only=True) != binding:
++        raise ValueError('PLAYBACK_JOURNAL_BINDING_MISMATCH')
++    c = connect_source(journal_path)
++    try:
++        c.execute('BEGIN')
++        job = c.execute("""SELECT status,original_version_sha256,text_sha256 FROM jobs
++          WHERE thread_id=? AND turn_id=? AND item_id=?""", identity).fetchone()
++        audit = c.execute("""SELECT generation_snapshot,original_receipt_sha256,
++          native_session_snapshot,job_generation_snapshot FROM admission_audit
++          WHERE thread_id=? AND turn_id=? AND item_id=?""", identity).fetchone()
++        c.rollback()
++    finally:
++        c.close()
++    if job is None or audit is None:
++        raise ValueError('PLAYBACK_IMMUTABLE_JOB_PROOF_ABSENT')
++    record = dict(matches[0], journal_status=job[0],
++                  journal_original_version_sha256=job[1], journal_text_sha256=job[2],
++                  job_voice_session_generation=audit[0], job_receipt_sha256=audit[1],
++                  job_native_session_id=audit[2], job_generation=audit[3])
++    return build_playback_evidence(record, admission_receipts, authorization)
++
++
+ def write_receipt(path, result):
+     path = local_output(path)
+     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+diff --git a/fdv/producer/test_admission.py b/fdv/producer/test_admission.py
+index 26c52473606a90daa9a1bd03253aeccf028fd1d2..5ecb4b5f6ea17871e927b23aa1cfed665d1980cc 100644
+--- a/fdv/producer/test_admission.py
++++ b/fdv/producer/test_admission.py
+@@ -12,7 +12,7 @@ import uuid
+ 
+ from admission_gate import evaluate_final_admission, frozen_turns, parse_freeze
+ from final_producer import (ROOT, canonical, connect_source, poll_once,
+-                            read_snapshot, sha, write_receipt)
++                            read_playback_evidence, read_snapshot, sha, write_receipt)
+ 
+ sys.dont_write_bytecode = True
+ RUN = ROOT / ('admission-tests-' + uuid.uuid4().hex)
+@@ -42,13 +42,14 @@ def case(name):
+ def contracts(thread='FAKE_THREAD', turn='FAKE_TURN', generation=1, input_digest=None):
+     origin = 'opaque_origin_without_generation_syntax'
+     receipt = {'schema': 'fdv.voice.admission.v1', 'receipt_id': 'FAKE_QUEUE',
+-               'thread_id': thread, 'voice_session_generation': generation,
++               'thread_id': thread, 'native_session_id': 'FAKE_NATIVE_SESSION',
++               'voice_session_generation': generation,
+                'origin_id': origin, 'handoff_id': None, 'item_id': None,
+                'client_id': origin, 'queued_item_id': 'FAKE_QUEUE',
+                'turn_id': turn, 'admission_result': 'Started',
+                'attempt_id': 'FAKE_ATTEMPT', 'input_digest': input_digest}
+-    auth = {'schema': 'fdv.voice.authorization.v1', 'state': 'Active',
+-            **{k: receipt[k] for k in ('thread_id', 'voice_session_generation',
++    auth = {'schema': 'fdv.voice.authorization.v1', 'state': 'Active', 'job_generation': 0,
++            **{k: receipt[k] for k in ('thread_id', 'native_session_id', 'voice_session_generation',
+                                       'origin_id', 'client_id', 'queued_item_id', 'input_digest')}}
+     return receipt, auth
+ 
+@@ -117,6 +118,7 @@ def _():
+ @case('scope_mutations_in_receipt_cannot_authorize_backend_final')
+ def _():
+     mutations = {'thread_id': 'OTHER_THREAD', 'turn_id': 'OTHER_TURN',
++                 'native_session_id': 'WRONG_NATIVE_SESSION',
+                  'voice_session_generation': 2, 'origin_id': 'OTHER_ORIGIN',
+                  'client_id': 'OTHER_CLIENT', 'queued_item_id': 'OTHER_QUEUE',
+                  'receipt_id': 'OTHER_RECEIPT', 'input_digest': 'OTHER_DIGEST',
+@@ -144,7 +146,11 @@ def _():
+                 {'voice_session_generation': '1'}, {'voice_session_generation': 2},
+                 {'state': 'Revoked'}, {'state': 'Unknown'}, {'thread_id': 'OTHER_THREAD'},
+                 {'client_id': 'OTHER_CLIENT'}, {'origin_id': 'OTHER_ORIGIN'},
+-                {'queued_item_id': 'OTHER_QUEUE'}, {'schema': 'UNKNOWN'}]
++                {'queued_item_id': 'OTHER_QUEUE'}, {'schema': 'UNKNOWN'},
++                {'native_session_id': 'WRONG_NATIVE_SESSION'},
++                {'native_session_id': ''}, {'job_generation': -1},
++                {'job_generation': True}, {'job_generation': '0'},
++                {'job_generation': 9007199254740992}]
+     for changes in variants:
+         f, r, a, _ = fixture(); a.update(changes)
+         check(poll(f, r, a)['fake_eligible_jobs'] == 0, 'invalid or different current authorization blocked')
+@@ -286,6 +292,106 @@ def _():
+           'audit cannot advertise stale eligibility after source disappears')
+ 
+ 
++
++@case('native_session_required_and_wrong_session_holds_same_thread_and_generation')
++def _():
++    for side in ('receipt', 'authorization'):
++        for value in (None, '', 'WRONG_NATIVE_SESSION'):
++            f, r, a, _ = fixture()
++            (r if side == 'receipt' else a)['native_session_id'] = value
++            check(poll(f, r, a)['fake_eligible_jobs'] == 0,
++                  'same thread/generation wrong or invalid native session holds')
++        f, r, a, _ = fixture(); del (r if side == 'receipt' else a)['native_session_id']
++        check(poll(f, r, a)['fake_eligible_jobs'] == 0, 'missing native binding is not wildcard')
++    f, r, a, _ = fixture(); poll(f, r, a)
++    r2 = dict(r, native_session_id='SUCCESSOR_NATIVE'); a2 = dict(a, native_session_id='SUCCESSOR_NATIVE')
++    check(poll(f, r2, a2)['fake_eligible_jobs'] == 0,
++          'matching rewritten receipt/auth cannot rebind old final into new native session')
++    decision = json.loads(query(f, 'SELECT latest_decision_json FROM admission_audit')[0][0])
++    check(decision['reason'] == 'JOB_NATIVE_SESSION_SNAPSHOT_MISMATCH', 'explicit native snapshot guard')
++
++
++@case('job_generation_is_persisted_and_cannot_be_refreshed_after_speech_onset')
++def _():
++    f, r, a, _ = fixture(); check(poll(f, r, a)['fake_eligible_jobs'] == 1, 'initial generation accepted')
++    check(query(f, 'SELECT native_session_snapshot,job_generation_snapshot FROM admission_audit')[0]
++          == ('FAKE_NATIVE_SESSION', 0), 'native and job generation stored in transaction')
++    advanced = dict(a, job_generation=1)
++    check(poll(f, r, advanced)['fake_eligible_jobs'] == 0, 'new boundary generation cannot reauthorize old final')
++    decision = json.loads(query(f, 'SELECT latest_decision_json FROM admission_audit')[0][0])
++    check(decision['reason'] == 'JOB_PLAYBACK_GENERATION_SNAPSHOT_MISMATCH', 'job generation rejection explicit')
++    check(query(f, 'SELECT job_generation_snapshot FROM admission_audit')[0][0] == 0,
++          'first job generation remains immutable')
++    f, r, a, _ = fixture(); del a['job_generation']
++    check(poll(f, r, a)['fake_eligible_jobs'] == 0, 'absence of job generation is not wildcard')
++
++
++@case('playback_packet_has_exact_join_and_is_provenance_only_not_audio_permission')
++def _():
++    f, r, a, final = fixture(); poll(f, r, a)
++    packet = read_playback_evidence(f / 'source.sqlite', 'FAKE_THREAD', f / 'journal.sqlite',
++                                   ('FAKE_THREAD', 'FAKE_TURN', 'FAKE_FINAL'),
++                                   admission_receipts=[r], authorization=a)
++    check(packet['identity'] == {
++        'thread_id': 'FAKE_THREAD', 'native_session_id': 'FAKE_NATIVE_SESSION',
++        'voice_session_generation': 1, 'origin_id': r['origin_id'], 'client_id': r['client_id'],
++        'queued_item_id': r['queued_item_id'], 'turn_id': 'FAKE_TURN',
++        'final_agent_item_id': 'FAKE_FINAL', 'first_user_item_id': 'FAKE_USER', 'job_generation': 0,
++    }, 'packet binds each required identity')
++    check(packet['provenance_only'] and not packet['egress_authorized'], 'packet is never permission to play')
++    check(packet['journal']['job_generation'] == 0 and packet['journal']['status'] == 'ELIGIBLE_FAKE_ONLY',
++          'packet carries immutable journal rather than caller refreshed generation')
++    check(packet['source']['first_user']['client_id'] == r['client_id'], 'first user proof included')
++    check(packet['source']['final_item']['text'] == final['text'], 'text retained without heuristic stripping')
++    check(packet['receipt_sha256'] == sha(canonical(r)) and packet['authorization_sha256'] == sha(canonical(a)),
++          'snapshot canonical hashes match exact packets')
++    r['native_session_id'] = 'MUTATED_AFTER_PACKET'; a['job_generation'] = 1
++    check(packet['admission_receipt']['native_session_id'] == 'FAKE_NATIVE_SESSION'
++          and packet['authorization']['job_generation'] == 0, 'packet detached from later caller mutation')
++    write_receipt(RUN / 'PLAYBACK-EVIDENCE-FAKE.json', packet)
++
++
++@case('playback_reader_refuses_new_generation_source_conflicts_and_unpolled_final')
++def _():
++    f, r, a, final = fixture(); poll(f, r, a)
++    def read(auth):
++        return read_playback_evidence(f / 'source.sqlite', 'FAKE_THREAD', f / 'journal.sqlite',
++                                     ('FAKE_THREAD', 'FAKE_TURN', 'FAKE_FINAL'),
++                                     admission_receipts=[r], authorization=auth)
++    for changed_auth in (dict(a, job_generation=1), dict(a, native_session_id='OTHER_NATIVE'),
++                         dict(a, state='Revoked')):
++        try: read(changed_auth)
++        except ValueError: check(True, 'current read refuses invalid authorization even before next poll')
++        else: check(False, 'invalid current authorization passed packet builder')
++    changed = dict(final, text='FAKE CHANGED AFTER LAST POLL')
++    modify(f, "UPDATE thread_items SET item_json=? WHERE item_id='FAKE_FINAL'", (canonical(changed),))
++    try: read(a)
++    except ValueError: check(True, 'current source changed after poll invalidates packet')
++    else: check(False, 'stale journal falsely authorized changed source')
++    poll(f, r, a)
++    modify(f, "UPDATE thread_items SET item_json=? WHERE item_id='FAKE_FINAL'", (canonical(final),))
++    try: read(a)
++    except ValueError: check(True, 'restored text does not erase journal HOLD_SOURCE_CONFLICT')
++    else: check(False, 'original text restoration bypassed persistent conflict')
++
++
++
++@case('missing_optional_questions_still_builds_packet_without_relaxing_delivery')
++def _():
++    f, r, a, final = fixture()
++    final.pop('questions')
++    modify(f, "UPDATE thread_items SET item_json=? WHERE item_id='FAKE_FINAL'", (canonical(final),))
++    check(poll(f, r, a)['fake_eligible_jobs'] == 1, 'schema permits absent optional questions')
++    packet = read_playback_evidence(f / 'source.sqlite', 'FAKE_THREAD', f / 'journal.sqlite',
++                                   ('FAKE_THREAD', 'FAKE_TURN', 'FAKE_FINAL'),
++                                   admission_receipts=[r], authorization=a)
++    check(packet['source']['final_item']['questions'] is None, 'absence explicitly projected as nullable questions')
++    check(packet['source']['final_item']['delivery'] is None, 'mandatory delivery remains present')
++    f2, r2, a2, final2 = fixture(); final2.pop('delivery')
++    modify(f2, "UPDATE thread_items SET item_json=? WHERE item_id='FAKE_FINAL'", (canonical(final2),))
++    check(poll(f2, r2, a2)['fake_eligible_jobs'] == 0, 'missing mandatory delivery still holds')
++
++
+ def main():
+     failed = sum(x['result'] == 'FAIL' for x in RESULTS)
+     result = {'schema': 'fdv.producer.admission.tests.v1',
+diff --git a/fdv/queue_sql_harness.py b/fdv/queue_sql_harness.py
+index 3435f1858951e6c59dd6dba3c0a49b7ef08a1175..1194402406d989807b4f54a715028544e5e6e164 100644
+--- a/fdv/queue_sql_harness.py
++++ b/fdv/queue_sql_harness.py
+@@ -26,7 +26,7 @@ THREAD = '00000000-0000-7000-8000-000000000001'
+ def digest(path): return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+ def encode(value): return json.dumps(value, sort_keys=True, separators=(',', ':'))
+ def origin(key='origin-A'):
+-    return dict(voice_session_generation=1, origin_id=key, handoff_id='handoff-'+key, item_id='item-'+key)
++    return dict(native_session_id='native-session-A', voice_session_generation=1, origin_id=key, handoff_id='handoff-'+key, item_id='item-'+key)
+ def payload(o, text='same legitimate words'):
+     return encode({'UserInput': {'client_id': o['origin_id'], 'content': [{'type':'text','text':text,'text_elements':[]}]}})
+ 
+@@ -49,9 +49,9 @@ class Queue:
+         p=payload(o,text); q=str(uuid.uuid4())
+         self.c.execute('BEGIN IMMEDIATE')
+         try:
+-            inserted=self.c.execute(SQL['ENQUEUE_VOICE_RECEIPT_SQL'],(THREAD,o['origin_id'],o['voice_session_generation'],o['handoff_id'],o['item_id'],q,o['origin_id'],p)).rowcount
++            inserted=self.c.execute(SQL['ENQUEUE_VOICE_RECEIPT_SQL'],(THREAD,o['origin_id'],o['native_session_id'],o['voice_session_generation'],o['handoff_id'],o['item_id'],q,o['origin_id'],p)).rowcount
+             row=self.get(o)
+-            if any(row[k]!=o[k] for k in ('origin_id','voice_session_generation','handoff_id','item_id')) or row['payload_json']!=p:
++            if any(row[k]!=o[k] for k in ('origin_id','native_session_id','voice_session_generation','handoff_id','item_id')) or row['payload_json']!=p:
+                 raise ValueError('ORIGIN_CONFLICT')
+             if inserted:
+                 n=self.c.execute(SQL['ENQUEUE_VOICE_ITEM_SQL'],(q,THREAD,p,THREAD,1,1,THREAD,100)).rowcount
+@@ -84,7 +84,7 @@ class Queue:
+         turn=turns[0]
+         self.c.execute('BEGIN IMMEDIATE')
+         try:
+-            row=self.c.execute(SQL['RECONCILE_VOICE_STARTED_SQL'],(turn,THREAD,o['origin_id'],o['origin_id'],turn)).fetchone()
++            row=self.c.execute(SQL['RECONCILE_VOICE_STARTED_SQL'],(turn,THREAD,o['native_session_id'],o['origin_id'],o['origin_id'],turn)).fetchone()
+             if row is None: raise ValueError('RECONCILE_REJECTED')
+             self.c.execute(SQL['REMOVE_VOICE_ITEM_SQL'],(THREAD,row['queued_item_id']))
+             self.c.commit(); return dict(row)
+@@ -162,6 +162,49 @@ def run():
+     except ValueError:check(True)
+     q.close();c.close();done('duplicate_origin_one_durable_admission_and_one_fake_started',before)
+ 
++    before=checks;q,c=bench('native_session_identity')
++    a=origin();original=q.enqueue(a);wrong=a|{'native_session_id':'native-session-B'}
++    check(q.public_receipt(a)['native_session_id']=='native-session-A')
++    try:q.enqueue(wrong);check(False)
++    except ValueError as e:check(str(e)=='ORIGIN_CONFLICT')
++    check(q.get(a)==original)
++    for invalid in (None,'','   '):
++        try:q.enqueue(a|{'origin_id':'invalid-session-'+repr(invalid),'native_session_id':invalid});check(False)
++        except sqlite3.IntegrityError:check(True)
++    try:q.c.execute('UPDATE voice_admission_receipts SET native_session_id=? WHERE origin_id=?',('native-session-B',a['origin_id']));check(False)
++    except sqlite3.IntegrityError:check(True)
++    claim=q.claim(a);turn=c.start_if_idle(claim)
++    try:q.reconcile(wrong,c);check(False)
++    except ValueError as e:check(str(e)=='RECONCILE_REJECTED')
++    check(q.get(a)['admission_result']=='Claimed')
++    reconciled=q.reconcile(a,c)
++    check(reconciled['turn_id']==turn and reconciled['native_session_id']==a['native_session_id'])
++    check(c.count()==1)
++    q.close();c.close();done('same_thread_generation_wrong_native_session_denied',before)
++
++    before=checks;d=base/'legacy_null_session';d.mkdir()
++    legacy=sqlite3.connect(d/'queue.sqlite',isolation_level=None)
++    migration_paths=sorted((REPO/'codex-rs/state/queue_migrations').glob('*.sql'))
++    for path in migration_paths:
++        if not path.name.startswith('0004_'):legacy.executescript(path.read_text())
++    old_origin=origin('old-unbound');old_payload=payload(old_origin)
++    legacy.execute("INSERT INTO voice_admission_receipts(thread_id,origin_id,voice_session_generation,queued_item_id,client_id,payload_json,admission_result) VALUES(?,?,1,?,?,?,'Queued')",(THREAD,old_origin['origin_id'],'old-queue',old_origin['origin_id'],old_payload))
++    legacy.execute(SQL['ENQUEUE_VOICE_ITEM_SQL'],('old-queue',THREAD,old_payload,THREAD,1,1,THREAD,100))
++    # This is a real old schema -> additive candidate migration, not NULL forged
++    # after validation. Preserve row identity/result and require fail-closed.
++    legacy.executescript((REPO/'codex-rs/state/queue_migrations/0004_voice_native_session.sql').read_text())
++    legacy.close();q=Queue(d);c=FakeCore(d)
++    check(q.get(old_origin)['native_session_id'] is None)
++    check(q.claim(old_origin) is None)
++    check(q.dispatch(old_origin,c)=='BLOCKED_OR_ALREADY_ADMITTED');check(c.count()==0)
++    try:q.enqueue(old_origin);check(False)
++    except ValueError as e:check(str(e)=='ORIGIN_CONFLICT')
++    try:q.c.execute('UPDATE voice_admission_receipts SET native_session_id=? WHERE origin_id=?',('native-session-A',old_origin['origin_id']));check(False)
++    except sqlite3.IntegrityError:check(True)
++    check(q.get(old_origin)['admission_result']=='Queued')
++    check(q.c.execute('SELECT count(*) FROM queued_items').fetchone()[0]==1)
++    q.close();c.close();done('pre_session_receipt_stays_unbound_and_cannot_replay',before)
++
+     before=checks;q,c=bench('busy')
+     a=origin('A');b=origin('B');q.enqueue(a);q.enqueue(b)
+     t1=q.dispatch(a,c);check(q.dispatch(b,c)=='BUSY_QUEUED');check(c.count()==1)
+@@ -208,11 +251,11 @@ def run():
+     # The integrated sample is generated through the same SQL and FAKE Core,
+     # then consumed by the evolved real producer. No hand-built Started receipt.
+     before=checks;q,c=bench('e2e');o=origin('E2E_ORIGIN');q.enqueue(o);turn=q.dispatch(o,c);final=c.complete(turn)
+-    receipt=q.public_receipt(o);check(receipt['client_id']==o['origin_id'])
++    receipt=q.public_receipt(o);check(receipt['client_id']==o['origin_id']);check(receipt['native_session_id']==o['native_session_id'])
+     check(c.turns_for_client(o['origin_id'])==[turn])
+     (base/'E2E-ADMISSION.json').write_text(json.dumps({'scope':'FAKE_CORE_REAL_CANDIDATE_SQL','receipt':receipt,'source_path':str(c.path),'final_agent_item_id':final},indent=2)+'\n')
+     q.close();c.close();done('client_id_preserved_into_fake_user_item_and_receipt',before)
+-    result={'schema':'fdv.queue.sql.tests.v1','result':'PASS','assertions':checks,'scenarios':len(cases),'cases':cases,'real_subprocesses':processes,'sqlite_version':sqlite3.sqlite_version,'sql_extracted_from_rust':True,'rust_execution':False,'core':'FAKE_EXPLICIT','voice_windows_network_audio':False,'source_hashes':{'queued_voice.rs':digest(RUST),'harness':digest(__file__)},'e2e_admission_path':str(base/'E2E-ADMISSION.json')}
++    result={'schema':'fdv.queue.sql.tests.v1','result':'PASS','assertions':checks,'scenarios':len(cases),'cases':cases,'real_subprocesses':processes,'sqlite_version':sqlite3.sqlite_version,'sql_extracted_from_rust':True,'rust_execution':False,'core':'FAKE_EXPLICIT','voice_windows_network_audio':False,'source_hashes':{'queued_voice.rs':digest(RUST),'harness':digest(__file__),'migration0003':digest(REPO/'codex-rs/state/queue_migrations/0003_queued_submission_receipts.sql'),'migration0004':digest(REPO/'codex-rs/state/queue_migrations/0004_voice_native_session.sql')},'e2e_admission_path':str(base/'E2E-ADMISSION.json')}
+     (base/'RECEIPT.json').write_text(json.dumps(result,indent=2)+'\n')
+     print(json.dumps({'receipt':str(base/'RECEIPT.json'),**{k:v for k,v in result.items() if k not in ('cases','source_hashes')}},indent=2))
+ 
