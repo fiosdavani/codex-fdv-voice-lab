@@ -298,7 +298,8 @@ impl QueuedItemService {
         if !self.queue.supports_voice_admission() {
             return Err(ThreadStoreError::InvalidRequest {
                 message: "durable voice admission is unavailable".to_string(),
-            }.into());
+            }
+            .into());
         }
         let TurnInput::UserInput { client_id, .. } = &mut input else {
             return Err(QueueServiceError::InvalidInput);
@@ -318,7 +319,8 @@ impl QueuedItemService {
             VoiceEnqueueOutcome::Existing(receipt) => Ok(receipt),
             VoiceEnqueueOutcome::Inserted(receipt) => {
                 self.wake_if_loaded(thread_id).await;
-                self.get_voice_receipt(thread_id, receipt.origin_id).await?
+                self.get_voice_receipt(thread_id, receipt.origin_id)
+                    .await?
                     .ok_or(QueueServiceError::VoiceAdmissionBlocked)
             }
         }
@@ -344,9 +346,16 @@ impl QueuedItemService {
     ) -> Result<VoiceAdmissionReceipt, QueueServiceError> {
         let receipt = {
             let _guard = self.dispatch_guard(thread_id).await;
-            let receipt = self.queue.reconcile_voice_started(
-                thread_id, native_session_id, origin_id, client_id, turn_id,
-            ).await?;
+            let receipt = self
+                .queue
+                .reconcile_voice_started(
+                    thread_id,
+                    native_session_id,
+                    origin_id,
+                    client_id,
+                    turn_id,
+                )
+                .await?;
             self.emit_changed(thread_id);
             receipt
         };
@@ -381,7 +390,11 @@ impl QueuedItemService {
     ) -> Result<Option<QueuedItem>, QueueServiceError> {
         let _dispatch_guard = self.dispatch_guard(thread_id).await;
         if self.queue.supports_voice_admission()
-            && self.queue.voice_receipt_for_item(thread_id, queued_item_id.clone()).await?.is_some()
+            && self
+                .queue
+                .voice_receipt_for_item(thread_id, queued_item_id.clone())
+                .await?
+                .is_some()
         {
             return Err(QueueServiceError::VoiceInputImmutable);
         }
@@ -480,10 +493,16 @@ impl QueuedItemService {
             return Err(QueueServiceError::InvalidInput);
         };
         let tracked = self.queue.supports_voice_admission()
-            && self.queue.voice_receipt_for_item(thread_id, queued_item_id.clone()).await?.is_some();
+            && self
+                .queue
+                .voice_receipt_for_item(thread_id, queued_item_id.clone())
+                .await?
+                .is_some();
         let attempt_id = if tracked {
             let attempt_id = Uuid::now_v7().to_string();
-            self.queue.claim_voice(thread_id, queued_item_id.clone(), attempt_id.clone()).await?
+            self.queue
+                .claim_voice(thread_id, queued_item_id.clone(), attempt_id.clone())
+                .await?
                 .ok_or(QueueServiceError::VoiceAdmissionBlocked)?;
             Some(attempt_id)
         } else {
@@ -522,7 +541,9 @@ impl QueuedItemService {
                 },
             };
             // On failure the durable claim remains ineligible; never requeue it.
-            self.queue.finish_voice_claim(thread_id, queued_item_id, attempt_id, outcome).await?;
+            self.queue
+                .finish_voice_claim(thread_id, queued_item_id, attempt_id, outcome)
+                .await?;
             self.emit_changed(thread_id);
         } else if matches!(&submission, Ok(StartIfIdleSubmission::Started { .. })) {
             self.delete_locked(thread_id, queued_item_id).await?;
@@ -567,7 +588,10 @@ impl QueuedItemService {
             match self
                 .start_item_locked(
                     thread.as_ref(),
-                    QueuedItem { id: queued_item_id.clone(), input },
+                    QueuedItem {
+                        id: queued_item_id.clone(),
+                        input,
+                    },
                     /*trace*/ None,
                 )
                 .await

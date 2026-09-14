@@ -71,11 +71,17 @@ async fn voice_manual_and_idle_dispatch_share_durable_receipts() -> anyhow::Resu
     let admission = Arc::new(TestAdmission(AtomicBool::new(true)));
     let mut extensions = ExtensionRegistryBuilder::new();
     extensions.turn_start_admission(admission.clone());
-    let test = test_codex().with_extensions(Arc::new(extensions.build()))
-        .build_with_auto_env(&server).await?;
+    let test = test_codex()
+        .with_extensions(Arc::new(extensions.build()))
+        .build_with_auto_env(&server)
+        .await?;
     let thread_id = test.session_configured.thread_id;
     let queue = loaded_thread_queue(&test)?;
-    let staged = QueuedItemService::new(Arc::clone(&queue), Weak::new(), Arc::new(NoopExtensionEventSink));
+    let staged = QueuedItemService::new(
+        Arc::clone(&queue),
+        Weak::new(),
+        Arc::new(NoopExtensionEventSink),
+    );
     let origin = VoiceQueueOrigin {
         native_session_id: "native-session-A".to_string(),
         voice_session_generation: 1,
@@ -83,29 +89,79 @@ async fn voice_manual_and_idle_dispatch_share_durable_receipts() -> anyhow::Resu
         handoff_id: Some("handoff".to_string()),
         item_id: Some("item".to_string()),
     };
-    let queued = staged.enqueue_voice(thread_id, user_input("one utterance"), origin.clone()).await?;
+    let queued = staged
+        .enqueue_voice(thread_id, user_input("one utterance"), origin.clone())
+        .await?;
     assert_eq!(origin.native_session_id, queued.native_session_id);
     let mut wrong_session = origin.clone();
     wrong_session.native_session_id = "native-session-B".to_string();
-    assert!(staged.enqueue_voice(thread_id, user_input("one utterance"), wrong_session).await.is_err());
-    assert_eq!(queued, staged.enqueue_voice(thread_id, user_input("one utterance"), origin.clone()).await?);
-    assert!(staged.enqueue_voice(thread_id, user_input("conflicting utterance"), origin.clone()).await.is_err());
-    assert!(matches!(staged.update(thread_id, queued.queued_item_id.clone(), user_input("changed")).await,
-        Err(QueueServiceError::VoiceInputImmutable)));
+    assert!(
+        staged
+            .enqueue_voice(thread_id, user_input("one utterance"), wrong_session)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        queued,
+        staged
+            .enqueue_voice(thread_id, user_input("one utterance"), origin.clone())
+            .await?
+    );
+    assert!(
+        staged
+            .enqueue_voice(
+                thread_id,
+                user_input("conflicting utterance"),
+                origin.clone()
+            )
+            .await
+            .is_err()
+    );
+    assert!(matches!(
+        staged
+            .update(
+                thread_id,
+                queued.queued_item_id.clone(),
+                user_input("changed")
+            )
+            .await,
+        Err(QueueServiceError::VoiceInputImmutable)
+    ));
     let thread = test.thread_manager.get_thread(thread_id).await?;
-    let submission = staged.start(thread.as_ref(), Some(queued.queued_item_id.clone()), /*trace*/ None).await?;
-    assert_eq!(StartIfIdleSubmission::NotSubmitted { reason: NotSubmittedReason::ServerDraining }, submission);
+    let submission = staged
+        .start(
+            thread.as_ref(),
+            Some(queued.queued_item_id.clone()),
+            /*trace*/ None,
+        )
+        .await?;
+    assert_eq!(
+        StartIfIdleSubmission::NotSubmitted {
+            reason: NotSubmittedReason::ServerDraining
+        },
+        submission
+    );
     let mut expected = queued;
     expected.reason = Some("ServerDraining".to_string());
-    assert_eq!(Some(expected.clone()), staged.get_voice_receipt(thread_id, origin.origin_id.clone()).await?);
+    assert_eq!(
+        Some(expected.clone()),
+        staged
+            .get_voice_receipt(thread_id, origin.origin_id.clone())
+            .await?
+    );
     assert!(response.requests().is_empty());
     admission.0.store(false, Ordering::SeqCst);
-    let service = QueuedItemService::new(queue, Arc::downgrade(&test.thread_manager), Arc::new(NoopExtensionEventSink));
+    let service = QueuedItemService::new(
+        queue,
+        Arc::downgrade(&test.thread_manager),
+        Arc::new(NoopExtensionEventSink),
+    );
     emit_idle(&service, thread_id).await;
     let turn_id = wait_for_event_match(test.codex.as_ref(), |event| match event {
         EventMsg::TurnStarted(turn) => Some(turn.turn_id.clone()),
         _ => None,
-    }).await;
+    })
+    .await;
     let user_receipt = wait_for_event_match(test.codex.as_ref(), |event| match event {
         EventMsg::ItemCompleted(event) => match &event.item {
             TurnItem::UserMessage(item) => Some((
@@ -116,13 +172,20 @@ async fn voice_manual_and_idle_dispatch_share_durable_receipts() -> anyhow::Resu
             _ => None,
         },
         _ => None,
-    }).await;
+    })
+    .await;
     assert_eq!(
         (thread_id, turn_id.clone(), Some(origin.origin_id.clone())),
         user_receipt,
     );
-    wait_for_event_match(test.codex.as_ref(), |event| matches!(event, EventMsg::TurnComplete(_)).then_some(())).await;
-    let started = service.get_voice_receipt(thread_id, origin.origin_id.clone()).await?.context("receipt")?;
+    wait_for_event_match(test.codex.as_ref(), |event| {
+        matches!(event, EventMsg::TurnComplete(_)).then_some(())
+    })
+    .await;
+    let started = service
+        .get_voice_receipt(thread_id, origin.origin_id.clone())
+        .await?
+        .context("receipt")?;
     expected.admission_result = VoiceAdmissionResult::Started;
     expected.attempt_id = started.attempt_id.clone();
     expected.turn_id = Some(turn_id);
@@ -130,12 +193,16 @@ async fn voice_manual_and_idle_dispatch_share_durable_receipts() -> anyhow::Resu
     assert_eq!(expected, started);
     assert!(started.attempt_id.is_some());
     assert!(service.list(thread_id).await?.is_empty());
-    assert_eq!(started, service.enqueue_voice(thread_id, user_input("one utterance"), origin).await?);
+    assert_eq!(
+        started,
+        service
+            .enqueue_voice(thread_id, user_input("one utterance"), origin)
+            .await?
+    );
     emit_idle(&service, thread_id).await;
     assert_eq!(1, response.requests().len());
     Ok(())
 }
-
 
 #[derive(Debug)]
 struct TestAdmission(AtomicBool);

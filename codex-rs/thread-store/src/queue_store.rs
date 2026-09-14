@@ -162,7 +162,11 @@ impl QueueStore for LocalQueueStore {
         payload: String,
         origin: VoiceQueueOrigin,
     ) -> ThreadStoreFuture<'_, VoiceEnqueueOutcome> {
-        queue_future(async move { self.queue().enqueue_voice(thread_id, &payload, &origin).await })
+        queue_future(async move {
+            self.queue()
+                .enqueue_voice(thread_id, &payload, &origin)
+                .await
+        })
     }
 
     fn get_voice_receipt(
@@ -178,7 +182,11 @@ impl QueueStore for LocalQueueStore {
         thread_id: ThreadId,
         item_id: String,
     ) -> ThreadStoreFuture<'_, Option<VoiceAdmissionReceipt>> {
-        queue_future(async move { self.queue().voice_receipt_for_item(thread_id, &item_id).await })
+        queue_future(async move {
+            self.queue()
+                .voice_receipt_for_item(thread_id, &item_id)
+                .await
+        })
     }
 
     fn claim_voice(
@@ -187,7 +195,11 @@ impl QueueStore for LocalQueueStore {
         item_id: String,
         attempt_id: String,
     ) -> ThreadStoreFuture<'_, Option<VoiceAdmissionReceipt>> {
-        queue_future(async move { self.queue().claim_voice(thread_id, &item_id, &attempt_id).await })
+        queue_future(async move {
+            self.queue()
+                .claim_voice(thread_id, &item_id, &attempt_id)
+                .await
+        })
     }
 
     fn finish_voice_claim(
@@ -198,7 +210,9 @@ impl QueueStore for LocalQueueStore {
         outcome: VoiceClaimOutcome,
     ) -> ThreadStoreFuture<'_, VoiceAdmissionReceipt> {
         queue_future(async move {
-            self.queue().finish_voice_claim(thread_id, &item_id, &attempt_id, outcome).await
+            self.queue()
+                .finish_voice_claim(thread_id, &item_id, &attempt_id, outcome)
+                .await
         })
     }
 
@@ -211,7 +225,15 @@ impl QueueStore for LocalQueueStore {
         turn_id: String,
     ) -> ThreadStoreFuture<'_, VoiceAdmissionReceipt> {
         queue_future(async move {
-            self.queue().reconcile_voice_started(thread_id, &native_session_id, &origin_id, &client_id, &turn_id).await
+            self.queue()
+                .reconcile_voice_started(
+                    thread_id,
+                    &native_session_id,
+                    &origin_id,
+                    &client_id,
+                    &turn_id,
+                )
+                .await
         })
     }
 

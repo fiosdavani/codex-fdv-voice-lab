@@ -50,8 +50,7 @@ WHERE thread_id = ? AND queued_item_id = ? AND admission_result = 'Claimed' AND 
 AND native_session_id IS NOT NULL AND length(trim(native_session_id)) > 0
 RETURNING *
 "#;
-const REMOVE_VOICE_ITEM_SQL: &str =
-    "DELETE FROM queued_items WHERE thread_id = ? AND id = ?";
+const REMOVE_VOICE_ITEM_SQL: &str = "DELETE FROM queued_items WHERE thread_id = ? AND id = ?";
 const RECONCILE_VOICE_STARTED_SQL: &str = r#"
 UPDATE voice_admission_receipts SET admission_result = 'Started', turn_id = ?, reason = NULL
 WHERE thread_id = ? AND native_session_id = ? AND origin_id = ? AND client_id = ?
@@ -69,11 +68,19 @@ impl SqliteQueueStore {
         origin: &VoiceQueueOrigin,
     ) -> anyhow::Result<VoiceEnqueueOutcome> {
         anyhow::ensure!(!origin.origin_id.is_empty(), "voice origin id is empty");
-        anyhow::ensure!(!origin.native_session_id.trim().is_empty(), "native session id is empty");
-        anyhow::ensure!(origin.voice_session_generation > 0, "invalid voice generation");
+        anyhow::ensure!(
+            !origin.native_session_id.trim().is_empty(),
+            "native session id is empty"
+        );
+        anyhow::ensure!(
+            origin.voice_session_generation > 0,
+            "invalid voice generation"
+        );
         let input: serde_json::Value = serde_json::from_str(payload_json)?;
         anyhow::ensure!(
-            input.pointer("/UserInput/client_id").and_then(serde_json::Value::as_str)
+            input
+                .pointer("/UserInput/client_id")
+                .and_then(serde_json::Value::as_str)
                 == Some(origin.origin_id.as_str()),
             "voice input client id does not match origin"
         );
@@ -198,7 +205,11 @@ impl SqliteQueueStore {
             VoiceClaimOutcome::Rejected { reason } => ("Rejected", None, Some(reason)),
             VoiceClaimOutcome::Ambiguous { reason } => ("Ambiguous", None, Some(reason)),
         };
-        let next_attempt = if state == "Queued" { None } else { Some(attempt_id) };
+        let next_attempt = if state == "Queued" {
+            None
+        } else {
+            Some(attempt_id)
+        };
         let mut transaction = self.pool.begin().await?;
         let row = sqlx::query(FINISH_VOICE_CLAIM_SQL)
             .bind(state)
@@ -212,7 +223,10 @@ impl SqliteQueueStore {
             .await?
             .ok_or_else(|| anyhow::anyhow!("voice claim no longer matches"))?;
         let receipt = VoiceAdmissionReceipt::try_from_row(&row)?;
-        if matches!(receipt.admission_result, VoiceAdmissionResult::Started | VoiceAdmissionResult::Rejected) {
+        if matches!(
+            receipt.admission_result,
+            VoiceAdmissionResult::Started | VoiceAdmissionResult::Rejected
+        ) {
             sqlx::query(REMOVE_VOICE_ITEM_SQL)
                 .bind(thread_id.to_string())
                 .bind(queued_item_id)
@@ -234,8 +248,14 @@ impl SqliteQueueStore {
         turn_id: &str,
     ) -> anyhow::Result<VoiceAdmissionReceipt> {
         anyhow::ensure!(!turn_id.is_empty(), "voice turn id is empty");
-        anyhow::ensure!(client_id == origin_id, "voice reconciliation client id mismatch");
-        anyhow::ensure!(!native_session_id.trim().is_empty(), "native session id is empty");
+        anyhow::ensure!(
+            client_id == origin_id,
+            "voice reconciliation client id mismatch"
+        );
+        anyhow::ensure!(
+            !native_session_id.trim().is_empty(),
+            "native session id is empty"
+        );
         let mut transaction = self.pool.begin().await?;
         let row = sqlx::query(RECONCILE_VOICE_STARTED_SQL)
             .bind(turn_id)

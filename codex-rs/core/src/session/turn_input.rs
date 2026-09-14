@@ -467,8 +467,10 @@ async fn start_if_idle(
     }
     // Bind after Core accepts StartIfIdle, before any task/output can execute.
     // Host queue receipt publication happens later and is too late for routing.
-    if let Err(error) = session.conversation
-        .activate_voice_turn(&submission_id, voice_client_id.as_deref()).await
+    if let Err(error) = session
+        .conversation
+        .activate_voice_turn(&submission_id, voice_client_id.as_deref())
+        .await
     {
         session.clear_reserved_idle_turn(&turn_state).await;
         return Err(CodexErr::InvalidRequest(error.to_string()));

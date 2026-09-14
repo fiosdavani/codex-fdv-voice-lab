@@ -2482,7 +2482,10 @@ impl Session {
             }
             EventMsg::ItemCompleted(event) => {
                 if let TurnItem::AgentMessage(item) = &event.item
-                    && self.conversation.finish_handoff_stream_item(turn_id, &item.id).await
+                    && self
+                        .conversation
+                        .finish_handoff_stream_item(turn_id, &item.id)
+                        .await
                 {
                     return;
                 }
@@ -2498,7 +2501,11 @@ impl Session {
     }
 
     async fn maybe_clear_realtime_handoff_for_event(&self, turn_id: &str, msg: &EventMsg) {
-        if let Err(err) = self.conversation.handle_terminal_handoff_event(turn_id, msg).await {
+        if let Err(err) = self
+            .conversation
+            .handle_terminal_handoff_event(turn_id, msg)
+            .await
+        {
             debug!("failed to finalize realtime handoff output: {err}");
         }
     }

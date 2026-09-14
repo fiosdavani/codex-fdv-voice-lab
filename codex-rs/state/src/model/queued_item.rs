@@ -82,7 +82,9 @@ impl VoiceAdmissionReceipt {
             schema: "fdv.voice.admission.v1".to_string(),
             thread_id: ThreadId::try_from(row.try_get::<String, _>("thread_id")?)?,
             native_session_id,
-            voice_session_generation: u64::try_from(row.try_get::<i64, _>("voice_session_generation")?)?,
+            voice_session_generation: u64::try_from(
+                row.try_get::<i64, _>("voice_session_generation")?,
+            )?,
             origin_id: row.try_get("origin_id")?,
             handoff_id: row.try_get("handoff_id")?,
             item_id: row.try_get("item_id")?,

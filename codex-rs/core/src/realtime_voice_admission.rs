@@ -28,7 +28,8 @@ pub(crate) fn voice_admission_input(
         &scope.native_session_id,
         scope.voice_session_generation,
         &handoff.handoff_id,
-    )).map_err(|_| "Voice origin serialization failed")?;
+    ))
+    .map_err(|_| "Voice origin serialization failed")?;
     Ok(VoiceAdmissionInput {
         thread_id,
         scope: scope.clone(),

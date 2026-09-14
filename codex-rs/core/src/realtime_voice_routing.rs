@@ -39,15 +39,22 @@ pub(crate) struct VoiceTurnRoutes {
 
 impl VoiceTurnRoutes {
     pub(crate) fn new(scope: VoiceAdmissionScope) -> Self {
-        Self { scope, origins: HashMap::new(), turns: HashMap::new() }
+        Self {
+            scope,
+            origins: HashMap::new(),
+            turns: HashMap::new(),
+        }
     }
 
     pub(crate) fn received(&mut self, input: &VoiceAdmissionInput) -> Result<(), &'static str> {
         if input.scope != self.scope {
             return Err("Voice origin belongs to another native session");
         }
-        let handoff_id = input.handoff_id.as_deref()
-            .filter(|id| !id.is_empty()).ok_or("Voice handoff identity missing")?;
+        let handoff_id = input
+            .handoff_id
+            .as_deref()
+            .filter(|id| !id.is_empty())
+            .ok_or("Voice handoff identity missing")?;
         if let Some(existing) = self.origins.get(&input.origin_id) {
             return if existing.handoff_id == handoff_id && existing.item_id == input.item_id {
                 Ok(())
@@ -58,21 +65,32 @@ impl VoiceTurnRoutes {
         if self.origins.len() >= MAX_SESSION_ORIGINS {
             return Err("Voice routing session capacity reached; no implicit eviction");
         }
-        self.origins.insert(input.origin_id.clone(), ReceivedOrigin {
-            handoff_id: handoff_id.to_string(), item_id: input.item_id.clone(),
-            turn_id: None, completed: false,
-            output_cancellation: CancellationToken::new(),
-        });
+        self.origins.insert(
+            input.origin_id.clone(),
+            ReceivedOrigin {
+                handoff_id: handoff_id.to_string(),
+                item_id: input.item_id.clone(),
+                turn_id: None,
+                completed: false,
+                output_cancellation: CancellationToken::new(),
+            },
+        );
         Ok(())
     }
 
     /// Called after StartIfIdle reserves and accepts the turn, before task spawn.
     /// Unknown client IDs are ordinary non-Voice turns: they gain no Voice route.
     pub(crate) fn started(
-        &mut self, turn_id: &str, client_id: Option<&str>,
+        &mut self,
+        turn_id: &str,
+        client_id: Option<&str>,
     ) -> Result<(), &'static str> {
-        let Some(client_id) = client_id else { return Ok(()); };
-        let Some(origin) = self.origins.get_mut(client_id) else { return Ok(()); };
+        let Some(client_id) = client_id else {
+            return Ok(());
+        };
+        let Some(origin) = self.origins.get_mut(client_id) else {
+            return Ok(());
+        };
         if turn_id.is_empty() {
             return Err("Voice turn identity missing");
         }
@@ -87,12 +105,17 @@ impl VoiceTurnRoutes {
             return Err("Turn already belongs to another Voice origin");
         }
         origin.turn_id = Some(turn_id.to_string());
-        self.turns.insert(turn_id.to_string(), VoiceTurnBinding {
-            native_session_id: self.scope.native_session_id.clone(),
-            voice_session_generation: self.scope.voice_session_generation,
-            turn_id: turn_id.to_string(), origin_id: client_id.to_string(),
-            client_id: client_id.to_string(), handoff_id: origin.handoff_id.clone(),
-        });
+        self.turns.insert(
+            turn_id.to_string(),
+            VoiceTurnBinding {
+                native_session_id: self.scope.native_session_id.clone(),
+                voice_session_generation: self.scope.voice_session_generation,
+                turn_id: turn_id.to_string(),
+                origin_id: client_id.to_string(),
+                client_id: client_id.to_string(),
+                handoff_id: origin.handoff_id.clone(),
+            },
+        );
         Ok(())
     }
 
@@ -102,7 +125,8 @@ impl VoiceTurnRoutes {
     }
 
     pub(crate) fn output_route(
-        &self, turn_id: &str,
+        &self,
+        turn_id: &str,
     ) -> Option<(VoiceTurnBinding, CancellationToken)> {
         let binding = self.binding(turn_id)?;
         let origin = self.origins.get(&binding.origin_id)?;
@@ -112,7 +136,9 @@ impl VoiceTurnRoutes {
     /// Queued outbound frames carry their handoff identity already. A completed
     /// origin remains known so its final queued frame can drain after TurnComplete.
     pub(crate) fn was_started(&self, handoff_id: &str) -> bool {
-        self.turns.values().any(|binding| binding.handoff_id == handoff_id)
+        self.turns
+            .values()
+            .any(|binding| binding.handoff_id == handoff_id)
     }
 
     pub(crate) fn complete(&mut self, turn_id: &str) {

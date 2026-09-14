@@ -528,5 +528,126 @@
       ]
     }
   ],
-  "compiler_corrections": []
+  "compiler_corrections": [
+    {
+      "path": "codex-rs/app-server/src/extensions.rs",
+      "sha256": "e92d9265d76b4ad9770a1c62445fe59b6ace2322f7500559ebae56231046ffd6",
+      "reason": "rustfmt 1.95.0 formatting only",
+      "rust_receipt": "RUN-02-RUST-RECEIPT.json sha256:1b2e978f7744326e81ae5650a9b39dd801903730ea32fc22c20c77b57d8ffe4c"
+    },
+    {
+      "path": "codex-rs/app-server/src/voice_admission.rs",
+      "sha256": "f2d3a992e797bdbeb93a5049306226d8d41541c19e62f0a006d22c408e842a4a",
+      "reason": "rustfmt 1.95.0 formatting only",
+      "rust_receipt": "RUN-02-RUST-RECEIPT.json sha256:1b2e978f7744326e81ae5650a9b39dd801903730ea32fc22c20c77b57d8ffe4c"
+    },
+    {
+      "path": "codex-rs/core/src/lib.rs",
+      "sha256": "62314fe0e8299fff3750a571196d5602042b7d387bb504bd8cd8f1c5768a0b24",
+      "reason": "rustfmt 1.95.0 formatting only",
+      "rust_receipt": "RUN-02-RUST-RECEIPT.json sha256:1b2e978f7744326e81ae5650a9b39dd801903730ea32fc22c20c77b57d8ffe4c"
+    },
+    {
+      "path": "codex-rs/core/src/realtime_conversation.rs",
+      "sha256": "0f8589d761464e6c2cc5a4c147ac55a48d01c1a1c5e806d0e5e4c648bf997a27",
+      "reason": "rustfmt 1.95.0 + clippy let_and_return",
+      "rust_receipt": "RUN-02-RUST-RECEIPT.json sha256:1b2e978f7744326e81ae5650a9b39dd801903730ea32fc22c20c77b57d8ffe4c"
+    },
+    {
+      "path": "codex-rs/core/src/realtime_voice_admission.rs",
+      "sha256": "05c32ee7cb69db0f6916ef3d31ca8c009b80cef18b76a8168fce8abcdb0f0a08",
+      "reason": "rustfmt 1.95.0 formatting only",
+      "rust_receipt": "RUN-02-RUST-RECEIPT.json sha256:1b2e978f7744326e81ae5650a9b39dd801903730ea32fc22c20c77b57d8ffe4c"
+    },
+    {
+      "path": "codex-rs/core/src/realtime_voice_admission_tests.rs",
+      "sha256": "8eeb18bca6c929dafd4b7be50c255d784e606a4e6f7ee265b7f52df8c9cf9957",
+      "reason": "rustfmt 1.95.0 formatting only",
+      "rust_receipt": "RUN-02-RUST-RECEIPT.json sha256:1b2e978f7744326e81ae5650a9b39dd801903730ea32fc22c20c77b57d8ffe4c"
+    },
+    {
+      "path": "codex-rs/core/src/realtime_voice_manager_tests.rs",
+      "sha256": "07ca7b61f8a0bd386acdc70fc4c044dff55eb39a0cdae59b7c9f643b3bc5c688",
+      "reason": "rustfmt 1.95.0 formatting only",
+      "rust_receipt": "RUN-02-RUST-RECEIPT.json sha256:1b2e978f7744326e81ae5650a9b39dd801903730ea32fc22c20c77b57d8ffe4c"
+    },
+    {
+      "path": "codex-rs/core/src/realtime_voice_routing.rs",
+      "sha256": "fbe4e08636f0a60e7673b1eb285dc86ea58cb1c044bc5c94ed1a49c7e474b51a",
+      "reason": "rustfmt 1.95.0 formatting only",
+      "rust_receipt": "RUN-02-RUST-RECEIPT.json sha256:1b2e978f7744326e81ae5650a9b39dd801903730ea32fc22c20c77b57d8ffe4c"
+    },
+    {
+      "path": "codex-rs/core/src/realtime_voice_routing_tests.rs",
+      "sha256": "25b2a0d916b63f71f4034a2c815406f863ef78177946b724dbfbdf0ed66babd7",
+      "reason": "rustfmt 1.95.0 formatting only",
+      "rust_receipt": "RUN-02-RUST-RECEIPT.json sha256:1b2e978f7744326e81ae5650a9b39dd801903730ea32fc22c20c77b57d8ffe4c"
+    },
+    {
+      "path": "codex-rs/core/src/session/mod.rs",
+      "sha256": "ab16f6e1b79c304cd5eccfb021ebaf6e9a945a1922661a0717e43256dd2452d0",
+      "reason": "rustfmt 1.95.0 formatting only",
+      "rust_receipt": "RUN-02-RUST-RECEIPT.json sha256:1b2e978f7744326e81ae5650a9b39dd801903730ea32fc22c20c77b57d8ffe4c"
+    },
+    {
+      "path": "codex-rs/core/src/session/turn_input.rs",
+      "sha256": "64d341f5ab4d7820782aa3a52cd6d993adcb7494dd0764177c331f2c5b5d7840",
+      "reason": "rustfmt 1.95.0 formatting only",
+      "rust_receipt": "RUN-02-RUST-RECEIPT.json sha256:1b2e978f7744326e81ae5650a9b39dd801903730ea32fc22c20c77b57d8ffe4c"
+    },
+    {
+      "path": "codex-rs/ext/queue/src/service.rs",
+      "sha256": "6c092efa50befc85abed129c49abcda9af73f7c046cf94b1b3579b74bbfb1ec9",
+      "reason": "rustfmt 1.95.0 formatting only",
+      "rust_receipt": "RUN-02-RUST-RECEIPT.json sha256:1b2e978f7744326e81ae5650a9b39dd801903730ea32fc22c20c77b57d8ffe4c"
+    },
+    {
+      "path": "codex-rs/ext/queue/tests/queue_service.rs",
+      "sha256": "ee5d7356cda5173b4ecad849ef977d6bfd1562cc313a367c049cf6616beb7edd",
+      "reason": "rustfmt 1.95.0 formatting only",
+      "rust_receipt": "RUN-02-RUST-RECEIPT.json sha256:1b2e978f7744326e81ae5650a9b39dd801903730ea32fc22c20c77b57d8ffe4c"
+    },
+    {
+      "path": "codex-rs/state/src/lib.rs",
+      "sha256": "3b3bbaf12ec83198bba39c68dea9c9f3b5e9f7602894d57b42cb6d13507bfc81",
+      "reason": "rustfmt 1.95.0 formatting only",
+      "rust_receipt": "RUN-02-RUST-RECEIPT.json sha256:1b2e978f7744326e81ae5650a9b39dd801903730ea32fc22c20c77b57d8ffe4c"
+    },
+    {
+      "path": "codex-rs/state/src/model/queued_item.rs",
+      "sha256": "94bef592325e60724572241270eabe96a54fa81fb6b3f8e2e0dc70f1052d53e2",
+      "reason": "rustfmt 1.95.0 formatting only",
+      "rust_receipt": "RUN-02-RUST-RECEIPT.json sha256:1b2e978f7744326e81ae5650a9b39dd801903730ea32fc22c20c77b57d8ffe4c"
+    },
+    {
+      "path": "codex-rs/state/src/runtime/queued_items.rs",
+      "sha256": "0377dd0a5feed9845be915caf5dda8744fe0fa6d02aaf7613c9202c1ce233ba9",
+      "reason": "rustfmt 1.95.0 formatting only",
+      "rust_receipt": "RUN-02-RUST-RECEIPT.json sha256:1b2e978f7744326e81ae5650a9b39dd801903730ea32fc22c20c77b57d8ffe4c"
+    },
+    {
+      "path": "codex-rs/state/src/runtime/queued_items_tests.rs",
+      "sha256": "97c29bcfeb0fd60d8dc7cf9c6635d2104b57d30e30b5b98cac267e196159cfd3",
+      "reason": "rustfmt 1.95.0 formatting only",
+      "rust_receipt": "RUN-02-RUST-RECEIPT.json sha256:1b2e978f7744326e81ae5650a9b39dd801903730ea32fc22c20c77b57d8ffe4c"
+    },
+    {
+      "path": "codex-rs/state/src/runtime/queued_voice.rs",
+      "sha256": "34053533eaed0d747868a89a758b2d734f02d440afe6c3501ffb812d309ddd46",
+      "reason": "rustfmt 1.95.0 formatting only",
+      "rust_receipt": "RUN-02-RUST-RECEIPT.json sha256:1b2e978f7744326e81ae5650a9b39dd801903730ea32fc22c20c77b57d8ffe4c"
+    },
+    {
+      "path": "codex-rs/thread-store/src/lib.rs",
+      "sha256": "1405c995624a133062e11fb73bdc79bba6680d77e36d55b1dbc52c6ad9b00043",
+      "reason": "rustfmt 1.95.0 formatting only",
+      "rust_receipt": "RUN-02-RUST-RECEIPT.json sha256:1b2e978f7744326e81ae5650a9b39dd801903730ea32fc22c20c77b57d8ffe4c"
+    },
+    {
+      "path": "codex-rs/thread-store/src/queue_store.rs",
+      "sha256": "72647e5b27618a6bccb0a5259f4936181782e6ff26254c0e8ac620f6bcea2c4e",
+      "reason": "rustfmt 1.95.0 formatting only",
+      "rust_receipt": "RUN-02-RUST-RECEIPT.json sha256:1b2e978f7744326e81ae5650a9b39dd801903730ea32fc22c20c77b57d8ffe4c"
+    }
+  ]
 }

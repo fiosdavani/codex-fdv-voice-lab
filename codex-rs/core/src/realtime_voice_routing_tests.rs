@@ -4,15 +4,21 @@ use pretty_assertions::assert_eq;
 
 fn origin(scope: &VoiceAdmissionScope, id: &str) -> VoiceAdmissionInput {
     VoiceAdmissionInput {
-        thread_id: ThreadId::new(), scope: scope.clone(), origin_id: id.to_string(),
-        handoff_id: Some(format!("handoff-{id}")), item_id: Some(format!("item-{id}")),
+        thread_id: ThreadId::new(),
+        scope: scope.clone(),
+        origin_id: id.to_string(),
+        handoff_id: Some(format!("handoff-{id}")),
+        item_id: Some(format!("item-{id}")),
         text: "same spoken words".to_string(),
     }
 }
 
 #[test]
 fn received_is_not_started_and_completion_does_not_consume_pending_origin() {
-    let scope = VoiceAdmissionScope { native_session_id: "native-A".into(), voice_session_generation: 1 };
+    let scope = VoiceAdmissionScope {
+        native_session_id: "native-A".into(),
+        voice_session_generation: 1,
+    };
     let mut routes = VoiceTurnRoutes::new(scope.clone());
     let a = origin(&scope, "origin-A");
     let b = origin(&scope, "origin-B");
@@ -26,11 +32,17 @@ fn received_is_not_started_and_completion_does_not_consume_pending_origin() {
     routes.complete("turn-A");
     assert_eq!(routes.binding("turn-A"), None);
     routes.started("turn-B", Some("origin-B")).unwrap();
-    assert_eq!(routes.binding("turn-B"), Some(&VoiceTurnBinding {
-        native_session_id: "native-A".into(), voice_session_generation: 1,
-        turn_id: "turn-B".into(), origin_id: "origin-B".into(), client_id: "origin-B".into(),
-        handoff_id: "handoff-origin-B".into(),
-    }));
+    assert_eq!(
+        routes.binding("turn-B"),
+        Some(&VoiceTurnBinding {
+            native_session_id: "native-A".into(),
+            voice_session_generation: 1,
+            turn_id: "turn-B".into(),
+            origin_id: "origin-B".into(),
+            client_id: "origin-B".into(),
+            handoff_id: "handoff-origin-B".into(),
+        })
+    );
     routes.complete("turn-A");
     assert!(routes.binding("turn-B").is_some());
     assert!(routes.started("another-turn", Some("origin-A")).is_err());
@@ -39,7 +51,10 @@ fn received_is_not_started_and_completion_does_not_consume_pending_origin() {
 
 #[test]
 fn mismatched_session_and_unknown_client_id_never_gain_routes() {
-    let scope = VoiceAdmissionScope { native_session_id: "native-A".into(), voice_session_generation: 7 };
+    let scope = VoiceAdmissionScope {
+        native_session_id: "native-A".into(),
+        voice_session_generation: 7,
+    };
     let mut routes = VoiceTurnRoutes::new(scope.clone());
     let mut wrong_session = origin(&scope, "origin-A");
     wrong_session.scope.native_session_id = "native-B".into();
@@ -53,7 +68,10 @@ fn mismatched_session_and_unknown_client_id_never_gain_routes() {
 
 #[test]
 fn aborted_origin_keeps_its_tombstone_and_cancels_cloned_emission_tokens() {
-    let scope = VoiceAdmissionScope { native_session_id: "native-A".into(), voice_session_generation: 1 };
+    let scope = VoiceAdmissionScope {
+        native_session_id: "native-A".into(),
+        voice_session_generation: 1,
+    };
     let mut routes = VoiceTurnRoutes::new(scope.clone());
     let a = origin(&scope, "origin-A");
     let b = origin(&scope, "origin-B");
@@ -79,7 +97,10 @@ fn aborted_origin_keeps_its_tombstone_and_cancels_cloned_emission_tokens() {
 
 #[test]
 fn completed_origin_cancels_new_emissions_but_retains_successful_final_identity() {
-    let scope = VoiceAdmissionScope { native_session_id: "native-A".into(), voice_session_generation: 1 };
+    let scope = VoiceAdmissionScope {
+        native_session_id: "native-A".into(),
+        voice_session_generation: 1,
+    };
     let mut routes = VoiceTurnRoutes::new(scope.clone());
     routes.received(&origin(&scope, "origin-A")).unwrap();
     routes.started("turn-A", Some("origin-A")).unwrap();

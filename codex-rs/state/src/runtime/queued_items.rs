@@ -180,7 +180,8 @@ impl SqliteQueueStore {
             .bind(item_id)
             .execute(transaction.as_mut())
             .await?
-            .rows_affected() > 0;
+            .rows_affected()
+            > 0;
         transaction.commit().await?;
         Ok(deleted)
     }
