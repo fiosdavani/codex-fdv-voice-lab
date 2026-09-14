@@ -4,12 +4,9 @@ on:
     branches: [fdv/native-integration-20260914-01]
 permissions:
   contents: read
-concurrency:
-  group: fdv-native-offline-${{ github.ref }}
-  cancel-in-progress: false
 jobs:
   rust-native:
-    if: github.repository == 'fiosdavani/codex-fdv-voice-lab' && github.ref == 'refs/heads/fdv/native-integration-20260914-01'
+    if: github.repository == 'fiosdavani/codex-fdv-voice-lab' && github.ref == 'refs/heads/fdv/native-integration-20260914-01' && !contains(github.event.head_commit.message, '[windows-ci-only]')
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     env:
@@ -60,6 +57,10 @@ jobs:
     if: github.repository == 'fiosdavani/codex-fdv-voice-lab' && github.ref == 'refs/heads/fdv/native-integration-20260914-01'
     runs-on: windows-2025
     timeout-minutes: 20
+    env:
+      GIT_CONFIG_COUNT: '1'
+      GIT_CONFIG_KEY_0: core.autocrlf
+      GIT_CONFIG_VALUE_0: 'false'
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
