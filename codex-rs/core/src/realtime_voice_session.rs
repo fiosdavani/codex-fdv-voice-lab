@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use tokio::sync::Mutex;
+use tokio::sync::Semaphore;
 
 const MAX_GENERATION: u64 = (1 << 53) - 1;
 static GENERATION: AtomicU64 = AtomicU64::new(0);
@@ -44,6 +45,8 @@ enum Phase {
 pub(super) struct NativeVoiceSession {
     start: NativeVoiceSessionStart,
     generation: u64,
+    // Serialize lifecycle I/O without retaining a phase-data mutex guard.
+    operation_gate: Semaphore,
     phase: Mutex<Phase>,
     pub(super) routes: Arc<Mutex<VoiceTurnRoutes>>,
 }
@@ -58,6 +61,7 @@ impl NativeVoiceSession {
         let session = Arc::new(Self {
             start,
             generation,
+            operation_gate: Semaphore::new(1),
             phase: Mutex::new(Phase::Starting),
             routes: Arc::new(Mutex::new(VoiceTurnRoutes::pending())),
         });
@@ -91,15 +95,19 @@ impl NativeVoiceSession {
         else {
             return Ok(());
         };
-        let mut phase = self.phase.lock().await;
-        match &*phase {
-            Phase::Closed { .. } => return Err("Native Voice session is closed".into()),
-            Phase::Ready(scope) if scope.native_session_id == *realtime_session_id => {
-                return Ok(());
+        let _operation = self.operation_gate.acquire().await
+            .map_err(|_| "Native Voice lifecycle is closed".to_string())?;
+        {
+            let phase = self.phase.lock().await;
+            match &*phase {
+                Phase::Closed { .. } => return Err("Native Voice session is closed".into()),
+                Phase::Ready(scope) if scope.native_session_id == *realtime_session_id => {
+                    return Ok(());
+                }
+                Phase::Ready(_) => return Err("Provider changed sealed native session identity".into()),
+                Phase::Sealing(_) => return Err("Native Voice readiness delivery is unresolved".into()),
+                Phase::Starting => {}
             }
-            Phase::Ready(_) => return Err("Provider changed sealed native session identity".into()),
-            Phase::Sealing(_) => return Err("Native Voice readiness delivery is unresolved".into()),
-            Phase::Starting => {}
         }
         if realtime_session_id.trim().is_empty() || realtime_session_id.len() > 1024 {
             return Err("Provider native session identity is invalid".into());
@@ -108,13 +116,13 @@ impl NativeVoiceSession {
             native_session_id: realtime_session_id.clone(),
             voice_session_generation: self.generation,
         };
-        *phase = Phase::Sealing(scope.clone());
+        *self.phase.lock().await = Phase::Sealing(scope.clone());
         self.emit(VoiceNativeSessionEvent::Ready {
             native_session_id: realtime_session_id.clone(),
         })
         .await?;
         self.routes.lock().await.seal(scope.clone());
-        *phase = Phase::Ready(scope);
+        *self.phase.lock().await = Phase::Ready(scope);
         Ok(())
     }
 
@@ -128,40 +136,61 @@ impl NativeVoiceSession {
     }
 
     pub(super) async fn retire(&self) {
-        let mut phase = self.phase.lock().await;
-        let native_session_id = match &*phase {
-            Phase::Closed { .. } => return,
-            Phase::Starting => None,
-            Phase::Ready(scope) | Phase::Sealing(scope) => Some(scope.native_session_id.clone()),
+        let Ok(_operation) = self.operation_gate.acquire().await else {
+            return;
         };
-        *phase = Phase::Closed {
-            native_session_id,
-            delivery: None,
-        };
+        self.retire_serialized().await;
+    }
+
+    /// Both callers hold operation_gate through retirement and any observer I/O.
+    async fn retire_serialized(&self) {
+        {
+            let mut phase = self.phase.lock().await;
+            match &*phase {
+                Phase::Closed { .. } => {}
+                Phase::Starting => {
+                    *phase = Phase::Closed {
+                        native_session_id: None,
+                        delivery: None,
+                    };
+                }
+                Phase::Ready(scope) | Phase::Sealing(scope) => {
+                    let native_session_id = Some(scope.native_session_id.clone());
+                    *phase = Phase::Closed {
+                        native_session_id,
+                        delivery: None,
+                    };
+                }
+            }
+        }
         self.routes.lock().await.close();
     }
 
     /// Call after the owned transport has stopped. Failed delivery is sticky;
     /// another close cannot convert uncertainty into an acknowledgement.
     pub(super) async fn close(&self) -> Result<(), String> {
-        self.retire().await;
-        let mut phase = self.phase.lock().await;
-        let Phase::Closed {
-            native_session_id,
-            delivery,
-        } = &mut *phase
-        else {
-            unreachable!("retire closes the native lifecycle");
+        let _operation = self.operation_gate.acquire().await
+            .map_err(|_| "Native Voice lifecycle is closed".to_string())?;
+        self.retire_serialized().await;
+        let native_session_id = {
+            let phase = self.phase.lock().await;
+            let Phase::Closed { native_session_id, delivery } = &*phase else {
+                unreachable!("retire closes the native lifecycle");
+            };
+            if let Some(result) = delivery {
+                return result.clone();
+            }
+            native_session_id.clone()
         };
-        if let Some(result) = delivery {
-            return result.clone();
-        }
         let result = self
             .emit(VoiceNativeSessionEvent::Closed {
                 native_session_id: native_session_id.clone(),
             })
             .await;
-        *delivery = Some(result.clone());
+        *self.phase.lock().await = Phase::Closed {
+            native_session_id,
+            delivery: Some(result.clone()),
+        };
         result
     }
 }

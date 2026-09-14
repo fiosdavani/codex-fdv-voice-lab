@@ -95,7 +95,7 @@ async fn native_close_waits_for_input_task_and_preserves_delivery_failure() {
         Err("close delivery failed".into()));
     assert_eq!(manager.shutdown_native("start", scope.voice_session_generation).await,
         Err("close delivery failed".into()));
-    assert_eq!(*manager.lifecycle_gate.lock().await, Some("close delivery failed".into()));
+    assert_eq!(*manager.native_close_error.lock().await, Some("close delivery failed".into()));
     assert_eq!(observer.signals.lock().unwrap().iter().filter(|signal|
         matches!(&signal.event, codex_extension_api::VoiceNativeSessionEvent::Closed { .. })).count(), 1);
 }
@@ -181,7 +181,8 @@ async fn manager(
     let (audio_tx, _) = async_channel::bounded(1);
     let (text_tx, _) = async_channel::bounded(1);
     let manager = RealtimeConversationManager {
-        lifecycle_gate: Mutex::new(None),
+        lifecycle_gate: Semaphore::new(1),
+        native_close_error: Mutex::new(None),
         state: Mutex::new(Some(ConversationState {
             native_voice: None,
             audio_tx,

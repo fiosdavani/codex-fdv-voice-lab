@@ -132,3 +132,71 @@ async fn failed_close_delivery_is_sticky_and_never_acknowledged_by_retry() {
     assert_eq!(observer.signals.lock().unwrap().iter()
         .filter(|signal| matches!(&signal.event, VoiceNativeSessionEvent::Closed { .. })).count(), 1);
 }
+
+#[tokio::test]
+async fn blocked_ready_ack_serializes_retire_and_close_without_holding_phase_mutex() {
+    use std::future::Future;
+    use std::task::Poll;
+
+    struct PausedObserver {
+        signals: std::sync::Mutex<Vec<VoiceNativeSessionSignal>>,
+        ready_release: Semaphore,
+    }
+
+    impl VoiceNativeSessionObserver for PausedObserver {
+        fn emit(&self, signal: VoiceNativeSessionSignal) -> VoiceNativeSessionFuture<'_> {
+            Box::pin(async move {
+                let ready = matches!(&signal.event, VoiceNativeSessionEvent::Ready { .. });
+                self.signals.lock().unwrap().push(signal);
+                if ready {
+                    let _release = self.ready_release.acquire().await
+                        .map_err(|_| "observer delivery cancelled".to_string())?;
+                }
+                Ok(())
+            })
+        }
+    }
+
+    let observer = Arc::new(PausedObserver {
+        signals: std::sync::Mutex::new(Vec::new()),
+        ready_release: Semaphore::new(0),
+    });
+    let native = NativeVoiceSession::begin(NativeVoiceSessionStart {
+        thread_id: ThreadId::new(),
+        start_id: "blocked-ready".into(),
+        hooks: VoiceNativeSessionHooks(observer.clone()),
+    }).await.unwrap();
+    let provider = provider_session("provider-A");
+    let mut ready = Box::pin(native.observe(&provider));
+    std::future::poll_fn(|cx| {
+        assert!(ready.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    }).await;
+    // Data remains readable while observer delivery is blocked. Admission does
+    // not become ready merely because its provider identity has been observed.
+    let mut pending_scope = Box::pin(native.scope());
+    std::future::poll_fn(|cx| {
+        let Poll::Ready(result) = pending_scope.as_mut().poll(cx) else {
+            panic!("phase mutex retained across observer delivery");
+        };
+        assert!(result.is_err());
+        Poll::Ready(())
+    }).await;
+    let mut retire = Box::pin(native.retire());
+    let mut close = Box::pin(native.close());
+    std::future::poll_fn(|cx| {
+        assert!(retire.as_mut().poll(cx).is_pending());
+        assert!(close.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    }).await;
+    observer.ready_release.add_permits(1);
+    ready.await.unwrap();
+    retire.await;
+    assert!(native.scope().await.is_err());
+    close.await.unwrap();
+    assert_eq!(observer.signals.lock().unwrap().iter().map(|signal| signal.event.clone()).collect::<Vec<_>>(), vec![
+        VoiceNativeSessionEvent::Starting,
+        VoiceNativeSessionEvent::Ready { native_session_id: "provider-A".into() },
+        VoiceNativeSessionEvent::Closed { native_session_id: Some("provider-A".into()) },
+    ]);
+}

@@ -30,5 +30,9 @@
   {
     "crate": "codex-core",
     "test_name": "realtime_conversation::strict_routing_tests::native_close_waits_for_input_task_and_preserves_delivery_failure"
+  },
+  {
+    "crate": "codex-core",
+    "test_name": "realtime_conversation::voice_session::tests::blocked_ready_ack_serializes_retire_and_close_without_holding_phase_mutex"
   }
 ]

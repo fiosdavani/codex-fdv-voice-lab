@@ -93,6 +93,10 @@ pub type VoiceNativeSessionFuture<'a> =
 /// must bound delivery time and report failures; Core admits no handoff until
 /// Ready is acknowledged. Captured thread/start/generation must never be replaced
 /// with a current-session lookup, including on Closed.
+/// Delivery runs under Core's lifecycle permit: do not reenter or await Core
+/// start/stop from this callback. Closed may confirm host presentation teardown,
+/// but must not resubmit Core stop. Runtime timeout enforcement belongs to the
+/// host; this candidate supplies no production observer.
 pub trait VoiceNativeSessionObserver: Send + Sync {
     fn emit(&self, signal: VoiceNativeSessionSignal) -> VoiceNativeSessionFuture<'_>;
 }

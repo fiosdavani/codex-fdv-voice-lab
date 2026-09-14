@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """New native lifecycle delta only, using the already validated nextest/JUnit parser."""
+import base64
 import hashlib
 import json
 from pathlib import Path
@@ -16,6 +17,9 @@ BASE = '04e7eca4009915f96953b328bafb3969517414de'
 gate = Gate(repo, out)
 gate.receipt.update(schema_version=2, BASE_APPROVED_RUST_PASS=BASE,
                     PRIOR_RUST_GATE='ACCEPTED_NO_REOPEN', NATIVE_DELTA_GATE='FAIL')
+gate.receipt['planned_test_selections'] = ['core realtime/voice and directly affected turn_input']
+gate.receipt.pop('ABORT_SIX', None)
+gate.receipt.pop('EXPECTED_58', None)
 try:
     required = json.loads((repo / 'fdv-native-ci/EXPECTED-RUST-TESTS.json').read_text())
     if not required or len({x['test_name'] for x in required}) != len(required):
@@ -39,6 +43,21 @@ try:
         gate.receipt['FMT_CORRECTION_SHA256'] = hashlib.sha256(patch.read_bytes()).hexdigest()
         rc, _ = gate.command('fmt-recheck', fmt + ['--check'])
     gate.receipt['FMT'] = 'PASS' if rc == 0 else 'FAIL'
+    # Export exact rustfmt bytes for application in the offline workspace. Full
+    # blobs, not a truncated console diff, bind the source to the compiled proof.
+    changed = subprocess.check_output(['git', 'diff', '--name-only'], cwd=repo, text=True).splitlines()
+    gate.receipt['FORMAT_EXPORT'] = []
+    for name in changed:
+        if not name.startswith('codex-rs/') or not name.endswith('.rs'):
+            raise EvidenceError('formatter changed an unexpected path: ' + name)
+        data = (repo / name).read_bytes()
+        sha = hashlib.sha256(data).hexdigest()
+        encoded = base64.b64encode(data).decode()
+        chunks = [encoded[i:i+8000] for i in range(0, len(encoded), 8000)]
+        gate.receipt['FORMAT_EXPORT'].append({'path': name, 'sha256': sha, 'chunks': len(chunks)})
+        for i, chunk in enumerate(chunks):
+            print('FORMATTED_SOURCE_CHUNK=' + json.dumps({'path': name, 'sha256': sha,
+                  'chunk_index': i, 'chunk_count': len(chunks), 'base64': chunk}), flush=True)
     for label, args in [
         ('CARGO_CHECK', ['cargo', 'check', '--locked', '--tests']),
         ('CLIPPY', ['cargo', 'clippy', '--locked', '--tests']),

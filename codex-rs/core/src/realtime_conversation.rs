@@ -202,7 +202,9 @@ impl RealtimeHandoffAdmission {
 }
 
 pub(crate) struct RealtimeConversationManager {
-    lifecycle_gate: Mutex<Option<String>>,
+    // The permit serializes async start/stop; the error mutex guards only data.
+    lifecycle_gate: Semaphore,
+    native_close_error: Mutex<Option<String>>,
     state: Mutex<Option<ConversationState>>,
     mode_instructions: Mutex<Option<RealtimeModeInstructions>>,
 }
@@ -639,7 +641,8 @@ struct RealtimeStartOutput {
 impl RealtimeConversationManager {
     pub(crate) fn new() -> Self {
         Self {
-            lifecycle_gate: Mutex::new(None),
+            lifecycle_gate: Semaphore::new(1),
+            native_close_error: Mutex::new(None),
             state: Mutex::new(None),
             mode_instructions: Mutex::new(None),
         }
@@ -690,9 +693,11 @@ impl RealtimeConversationManager {
         mut start: RealtimeStart,
         mode_instructions: RealtimeModeInstructions,
     ) -> CodexResult<RealtimeStartOutput> {
-        let mut lifecycle = self.lifecycle_gate.lock().await;
-        if let Some(error) = &*lifecycle {
-            return Err(CodexErr::InvalidRequest(error.clone()));
+        let _lifecycle = self.lifecycle_gate.acquire().await
+            .map_err(|_| CodexErr::InvalidRequest("Realtime lifecycle is closed".into()))?;
+        let close_error = self.native_close_error.lock().await.clone();
+        if let Some(error) = close_error {
+            return Err(CodexErr::InvalidRequest(error));
         }
         let previous_state = {
             let mut guard = self.state.lock().await;
@@ -701,7 +706,7 @@ impl RealtimeConversationManager {
         if let Some(state) = previous_state
             && let Err(error) = stop_conversation_state(state, RealtimeFanoutTaskStop::Await).await
         {
-            *lifecycle = Some(error.clone());
+            *self.native_close_error.lock().await = Some(error.clone());
             return Err(CodexErr::InvalidRequest(error));
         }
 
@@ -709,7 +714,7 @@ impl RealtimeConversationManager {
             Some(voice_start) => match NativeVoiceSession::begin(voice_start).await {
                 Ok(native) => Some(native),
                 Err(error) => {
-                    *lifecycle = Some(error.clone());
+                    *self.native_close_error.lock().await = Some(error.clone());
                     return Err(CodexErr::InvalidRequest(error));
                 }
             },
@@ -722,7 +727,7 @@ impl RealtimeConversationManager {
                     && let Err(close_error) = native_voice.close().await
                 {
                     warn!("native Voice start failure close delivery failed: {close_error}");
-                    *lifecycle = Some(close_error);
+                    *self.native_close_error.lock().await = Some(close_error);
                 }
                 return Err(error);
             }
@@ -919,7 +924,9 @@ impl RealtimeConversationManager {
     }
 
     pub(crate) async fn finish_if_active(&self, realtime_active: &Arc<AtomicBool>) -> bool {
-        let mut lifecycle = self.lifecycle_gate.lock().await;
+        let Ok(_lifecycle) = self.lifecycle_gate.acquire().await else {
+            return false;
+        };
         let state = {
             let mut guard = self.state.lock().await;
             match guard.as_ref() {
@@ -932,7 +939,7 @@ impl RealtimeConversationManager {
             return false;
         };
         if let Err(error) = stop_conversation_state(state, RealtimeFanoutTaskStop::Detach).await {
-            *lifecycle = Some(error);
+            *self.native_close_error.lock().await = Some(error);
             return false;
         }
         true
@@ -1452,7 +1459,8 @@ impl RealtimeConversationManager {
     }
 
     pub(crate) async fn shutdown(&self) -> CodexResult<()> {
-        let mut lifecycle = self.lifecycle_gate.lock().await;
+        let _lifecycle = self.lifecycle_gate.acquire().await
+            .map_err(|_| CodexErr::InvalidRequest("Realtime lifecycle is closed".into()))?;
         let state = {
             let mut guard = self.state.lock().await;
             guard.take()
@@ -1461,10 +1469,11 @@ impl RealtimeConversationManager {
         if let Some(state) = state
             && let Err(error) = stop_conversation_state(state, RealtimeFanoutTaskStop::Await).await
         {
-            *lifecycle = Some(error);
+            *self.native_close_error.lock().await = Some(error);
         }
-        if let Some(error) = &*lifecycle {
-            return Err(CodexErr::InvalidRequest(error.clone()));
+        let close_error = self.native_close_error.lock().await.clone();
+        if let Some(error) = close_error {
+            return Err(CodexErr::InvalidRequest(error));
         }
         Ok(())
     }
@@ -1476,9 +1485,11 @@ impl RealtimeConversationManager {
         start_id: &str,
         generation: u64,
     ) -> Result<bool, String> {
-        let mut lifecycle = self.lifecycle_gate.lock().await;
-        if let Some(error) = &*lifecycle {
-            return Err(error.clone());
+        let _lifecycle = self.lifecycle_gate.acquire().await
+            .map_err(|_| "Realtime lifecycle is closed".to_string())?;
+        let close_error = self.native_close_error.lock().await.clone();
+        if let Some(error) = close_error {
+            return Err(error);
         }
         let state = {
             let mut guard = self.state.lock().await;
@@ -1494,7 +1505,7 @@ impl RealtimeConversationManager {
         if let Some(state) = state
             && let Err(error) = stop_conversation_state(state, RealtimeFanoutTaskStop::Await).await
         {
-            *lifecycle = Some(error.clone());
+            *self.native_close_error.lock().await = Some(error.clone());
             return Err(error);
         }
         Ok(true)
