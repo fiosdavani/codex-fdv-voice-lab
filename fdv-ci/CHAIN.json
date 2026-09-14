@@ -648,6 +648,12 @@
       "sha256": "72647e5b27618a6bccb0a5259f4936181782e6ff26254c0e8ac620f6bcea2c4e",
       "reason": "rustfmt 1.95.0 formatting only",
       "rust_receipt": "RUN-02-RUST-RECEIPT.json sha256:1b2e978f7744326e81ae5650a9b39dd801903730ea32fc22c20c77b57d8ffe4c"
+    },
+    {
+      "path": "codex-rs/core/tests/suite/openai_file_mcp.rs",
+      "sha256": "701f49f4731d381937cdb4c727a553c4ea7880b34fe50abe2a51dd8560fe6645",
+      "reason": "Remove unused body_json import reported by clippy -D warnings at line47; exact original blob 9ae4b31214adcbc21cde15221f11575d6a478146 already present at upstream pin",
+      "rust_receipt": "RUN-03-RUST-RECEIPT.json sha256:0ab7b9fe28ed176ad773b3a853a1f436cb2016207db7f541fad9a5ca71e3289f"
     }
   ]
 }
