@@ -7,6 +7,139 @@ use pretty_assertions::assert_eq;
 use sqlx::migrate::Migrator;
 use std::borrow::Cow;
 
+fn voice_origin(id: &str) -> crate::VoiceQueueOrigin {
+    crate::VoiceQueueOrigin {
+        voice_session_generation: 1,
+        origin_id: id.to_string(),
+        handoff_id: Some("handoff".to_string()),
+        item_id: Some("item".to_string()),
+    }
+}
+
+fn voice_payload(origin: &crate::VoiceQueueOrigin, text: &str) -> String {
+    serde_json::to_string(&codex_protocol::turn_input::TurnInput::UserInput {
+        content: vec![codex_protocol::user_input::UserInput::Text {
+            text: text.to_string(),
+            text_elements: Vec::new(),
+        }],
+        client_id: Some(origin.origin_id.clone()),
+    }).unwrap()
+}
+
+#[tokio::test]
+async fn voice_origin_replay_cannot_replace_input_or_recreate_a_started_item() {
+    use crate::VoiceAdmissionResult;
+    use crate::VoiceClaimOutcome;
+    use crate::VoiceEnqueueOutcome;
+    let (runtime, thread_id) = runtime_with_thread().await;
+    let queue = runtime.thread_queue();
+    let origin = voice_origin("generation-1/utterance-1");
+    let payload = voice_payload(&origin, "first");
+    let VoiceEnqueueOutcome::Inserted(receipt) =
+        queue.enqueue_voice(thread_id, &payload, &origin).await.unwrap()
+    else { panic!("first origin must insert"); };
+    assert_eq!(
+        VoiceEnqueueOutcome::Existing(receipt.clone()),
+        queue.enqueue_voice(thread_id, &payload, &origin).await.unwrap(),
+    );
+    assert!(queue.enqueue_voice(thread_id, &voice_payload(&origin, "changed"), &origin).await.is_err());
+    assert_eq!(Some(receipt.clone()), queue.get_voice_receipt(thread_id, &origin.origin_id).await.unwrap());
+    queue.claim_voice(thread_id, &receipt.queued_item_id, "attempt-1").await.unwrap().unwrap();
+    let started = queue.finish_voice_claim(thread_id, &receipt.queued_item_id, "attempt-1",
+        VoiceClaimOutcome::Started { turn_id: "core-turn-1".to_string() },
+    ).await.unwrap();
+    let mut expected = receipt;
+    expected.admission_result = VoiceAdmissionResult::Started;
+    expected.attempt_id = Some("attempt-1".to_string());
+    expected.turn_id = Some("core-turn-1".to_string());
+    assert_eq!(expected, started);
+    assert!(queue.list_page(thread_id, /*offset*/ 0, /*limit*/ 1).await.unwrap().is_empty());
+    assert_eq!(VoiceEnqueueOutcome::Existing(started),
+        queue.enqueue_voice(thread_id, &payload, &origin).await.unwrap());
+    assert!(queue.list_page(thread_id, /*offset*/ 0, /*limit*/ 1).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn voice_claim_survives_restart_and_only_positive_reconciliation_dequeues() {
+    use crate::VoiceAdmissionResult;
+    use crate::VoiceClaimOutcome;
+    use crate::VoiceEnqueueOutcome;
+    let (runtime, thread_id) = runtime_with_thread().await;
+    let origin = voice_origin("generation-1/utterance-2");
+    let payload = voice_payload(&origin, "once");
+    let VoiceEnqueueOutcome::Inserted(receipt) =
+        runtime.thread_queue().enqueue_voice(thread_id, &payload, &origin).await.unwrap()
+    else { panic!("first origin must insert"); };
+    let other = StateRuntime::init(runtime.sqlite().clone(), "test-provider".to_string()).await.unwrap();
+    let (first, second) = tokio::join!(
+        runtime.thread_queue().claim_voice(thread_id, &receipt.queued_item_id, "attempt-a"),
+        other.thread_queue().claim_voice(thread_id, &receipt.queued_item_id, "attempt-b"),
+    );
+    let claims = [first.unwrap(), second.unwrap()];
+    assert_eq!(1, claims.iter().filter(|claim| claim.is_some()).count());
+    let claimed = claims.into_iter().flatten().next().unwrap();
+    let reopened = StateRuntime::init(runtime.sqlite().clone(), "test-provider".to_string()).await.unwrap();
+    let queue = reopened.thread_queue();
+    assert_eq!(Some(claimed.clone()), queue.get_voice_receipt(thread_id, &origin.origin_id).await.unwrap());
+    assert_eq!(None, queue.claim_voice(thread_id, &receipt.queued_item_id, "retry").await.unwrap());
+    assert!(queue.delete(thread_id, &receipt.queued_item_id).await.is_err());
+    assert_eq!(None, queue.update(thread_id, &receipt.queued_item_id, &voice_payload(&origin, "replace")).await.unwrap());
+    let attempt = claimed.attempt_id.as_deref().unwrap();
+    let ambiguous = queue.finish_voice_claim(thread_id, &receipt.queued_item_id, attempt,
+        VoiceClaimOutcome::Ambiguous { reason: "lost receipt".to_string() },
+    ).await.unwrap();
+    let mut expected = claimed;
+    expected.admission_result = VoiceAdmissionResult::Ambiguous;
+    expected.reason = Some("lost receipt".to_string());
+    assert_eq!(expected, ambiguous);
+    assert_eq!(None, queue.claim_voice(thread_id, &receipt.queued_item_id, "retry").await.unwrap());
+    assert!(queue.reconcile_voice_started(thread_id, &origin.origin_id, "wrong-client", "turn").await.is_err());
+    let started = queue.reconcile_voice_started(thread_id, &origin.origin_id, &origin.origin_id, "turn").await.unwrap();
+    expected.admission_result = VoiceAdmissionResult::Started;
+    expected.reason = None;
+    expected.turn_id = Some("turn".to_string());
+    assert_eq!(expected, started);
+    assert_eq!(started, queue.reconcile_voice_started(thread_id, &origin.origin_id, &origin.origin_id, "turn").await.unwrap());
+    assert!(queue.reconcile_voice_started(thread_id, &origin.origin_id, &origin.origin_id, "different-turn").await.is_err());
+    assert!(queue.list_page(thread_id, /*offset*/ 0, /*limit*/ 1).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn voice_busy_release_is_attempt_scoped_and_cancellation_keeps_tombstone() {
+    use crate::VoiceAdmissionResult;
+    use crate::VoiceClaimOutcome;
+    use crate::VoiceEnqueueOutcome;
+    let (runtime, thread_id) = runtime_with_thread().await;
+    let queue = runtime.thread_queue();
+    let origin = voice_origin("generation-1/utterance-3");
+    let payload = voice_payload(&origin, "later");
+    let VoiceEnqueueOutcome::Inserted(receipt) =
+        queue.enqueue_voice(thread_id, &payload, &origin).await.unwrap()
+    else { panic!("first origin must insert"); };
+    queue.claim_voice(thread_id, &receipt.queued_item_id, "busy-attempt").await.unwrap().unwrap();
+    let released = queue.finish_voice_claim(thread_id, &receipt.queued_item_id, "busy-attempt",
+        VoiceClaimOutcome::RetryableRejection { reason: "NotIdle".to_string() },
+    ).await.unwrap();
+    let mut expected = receipt.clone();
+    expected.reason = Some("NotIdle".to_string());
+    assert_eq!(expected, released);
+    queue.claim_voice(thread_id, &receipt.queued_item_id, "new-attempt").await.unwrap().unwrap();
+    assert!(queue.finish_voice_claim(thread_id, &receipt.queued_item_id, "busy-attempt",
+        VoiceClaimOutcome::Started { turn_id: "wrong".to_string() },
+    ).await.is_err());
+    queue.finish_voice_claim(thread_id, &receipt.queued_item_id, "new-attempt",
+        VoiceClaimOutcome::RetryableRejection { reason: "ServerDraining".to_string() },
+    ).await.unwrap();
+    assert!(queue.delete(thread_id, &receipt.queued_item_id).await.unwrap());
+    expected.admission_result = VoiceAdmissionResult::Cancelled;
+    expected.reason = Some("ServerDraining".to_string());
+    assert_eq!(Some(expected.clone()), queue.get_voice_receipt(thread_id, &origin.origin_id).await.unwrap());
+    assert_eq!(VoiceEnqueueOutcome::Existing(expected),
+        queue.enqueue_voice(thread_id, &payload, &origin).await.unwrap());
+    assert!(queue.list_page(thread_id, /*offset*/ 0, /*limit*/ 1).await.unwrap().is_empty());
+}
+
+
 async fn runtime_with_thread() -> (Arc<StateRuntime>, ThreadId) {
     let home = unique_temp_dir();
     let runtime = StateRuntime::init(

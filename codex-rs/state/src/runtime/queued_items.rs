@@ -5,6 +5,9 @@ use sqlx::Connection;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
+#[path = "queued_voice.rs"]
+mod voice;
+
 /// SQLite-backed persistence for durable, thread-scoped user messages.
 #[derive(Clone)]
 pub struct SqliteQueueStore {
@@ -136,6 +139,10 @@ impl SqliteQueueStore {
             "UPDATE queued_items
              SET payload_json = ?, updated_at_ms = ?
              WHERE thread_id = ? AND id = ?
+               AND NOT EXISTS (
+                   SELECT 1 FROM voice_admission_receipts
+                   WHERE queued_item_id = queued_items.id
+               )
              RETURNING id, thread_id, payload_json",
         )
         .bind(payload_json)
@@ -150,15 +157,32 @@ impl SqliteQueueStore {
     }
 
     pub async fn delete(&self, thread_id: ThreadId, item_id: &str) -> anyhow::Result<bool> {
-        Ok(
-            sqlx::query("DELETE FROM queued_items WHERE thread_id = ? AND id = ?")
-                .bind(thread_id.to_string())
-                .bind(item_id)
-                .execute(self.pool.as_ref())
-                .await?
-                .rows_affected()
-                > 0,
+        let mut transaction = self.pool.begin().await?;
+        sqlx::query(
+            "UPDATE voice_admission_receipts SET admission_result = 'Cancelled'
+             WHERE thread_id = ? AND queued_item_id = ? AND admission_result = 'Queued'",
         )
+        .bind(thread_id.to_string())
+        .bind(item_id)
+        .execute(transaction.as_mut())
+        .await?;
+        let blocked: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM voice_admission_receipts
+             WHERE thread_id = ? AND queued_item_id = ? AND admission_result != 'Cancelled'",
+        )
+        .bind(thread_id.to_string())
+        .bind(item_id)
+        .fetch_one(transaction.as_mut())
+        .await?;
+        anyhow::ensure!(blocked == 0, "claimed voice admission cannot be deleted");
+        let deleted = sqlx::query("DELETE FROM queued_items WHERE thread_id = ? AND id = ?")
+            .bind(thread_id.to_string())
+            .bind(item_id)
+            .execute(transaction.as_mut())
+            .await?
+            .rows_affected() > 0;
+        transaction.commit().await?;
+        Ok(deleted)
     }
 
     pub async fn reorder(&self, thread_id: ThreadId, ordered_ids: &[String]) -> anyhow::Result<()> {
@@ -201,12 +225,22 @@ impl SqliteQueueStore {
     }
 
     pub(crate) async fn delete_thread_queue(&self, thread_id: ThreadId) -> anyhow::Result<bool> {
-        Ok(sqlx::query("DELETE FROM queued_items WHERE thread_id = ?")
+        let mut transaction = self.pool.begin().await?;
+        sqlx::query(
+            "UPDATE voice_admission_receipts SET admission_result = 'Cancelled'
+             WHERE thread_id = ? AND admission_result = 'Queued'",
+        )
+        .bind(thread_id.to_string())
+        .execute(transaction.as_mut())
+        .await?;
+        let deleted = sqlx::query("DELETE FROM queued_items WHERE thread_id = ?")
             .bind(thread_id.to_string())
-            .execute(self.pool.as_ref())
+            .execute(transaction.as_mut())
             .await?
             .rows_affected()
-            > 0)
+            > 0;
+        transaction.commit().await?;
+        Ok(deleted)
     }
 }
 

@@ -6,6 +6,9 @@ use codex_extension_api::ExtensionRegistryBuilder;
 
 mod service;
 
+pub use codex_thread_store::VoiceAdmissionReceipt;
+pub use codex_thread_store::VoiceAdmissionResult;
+pub use codex_thread_store::VoiceQueueOrigin;
 pub use service::QueueServiceError;
 pub use service::QueuedItem;
 pub use service::QueuedItemService;

@@ -1,0 +1,9 @@
+{
+  "result": "PASS",
+  "checks": {
+    "approved_source_unchanged": true,
+    "original_private_journal_unchanged": true,
+    "candidate_base_byte_identical": true
+  },
+  "text_output": false
+}

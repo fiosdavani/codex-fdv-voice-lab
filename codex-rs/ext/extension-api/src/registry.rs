@@ -15,6 +15,7 @@ use crate::TurnInputContributor;
 use crate::TurnItemContributor;
 use crate::TurnLifecycleContributor;
 use crate::TurnStartAdmission;
+use crate::VoiceAdmission;
 
 /// Mutable registry used while hosts register typed runtime contributions.
 pub struct ExtensionRegistryBuilder<C: Sync> {
@@ -27,6 +28,7 @@ impl<C: Sync> Default for ExtensionRegistryBuilder<C> {
             registry: ExtensionRegistry {
                 event_sink: Arc::new(NoopExtensionEventSink),
                 turn_start_admission: None,
+                voice_admission: None,
                 thread_lifecycle_contributors: Vec::new(),
                 turn_lifecycle_contributors: Vec::new(),
                 config_contributors: Vec::new(),
@@ -65,6 +67,11 @@ impl<C: Sync> ExtensionRegistryBuilder<C> {
     /// Installs the host gate for turn-input submissions that start a new turn.
     pub fn turn_start_admission(&mut self, admission: Arc<dyn TurnStartAdmission>) {
         self.registry.turn_start_admission = Some(admission);
+    }
+
+    /// Supplies the durable host seam; only explicit VoiceAdmissionScope uses it.
+    pub fn voice_admission(&mut self, admission: Arc<dyn VoiceAdmission>) {
+        self.registry.voice_admission = Some(admission);
     }
 
     /// Registers one approval-review contributor.
@@ -147,6 +154,7 @@ impl<C: Sync> ExtensionRegistryBuilder<C> {
 pub struct ExtensionRegistry<C: Sync> {
     event_sink: Arc<dyn ExtensionEventSink>,
     turn_start_admission: Option<Arc<dyn TurnStartAdmission>>,
+    voice_admission: Option<Arc<dyn VoiceAdmission>>,
     thread_lifecycle_contributors: Vec<Arc<dyn ThreadLifecycleContributor<C>>>,
     turn_lifecycle_contributors: Vec<Arc<dyn TurnLifecycleContributor>>,
     config_contributors: Vec<Arc<dyn ConfigContributor<C>>>,
@@ -162,6 +170,11 @@ pub struct ExtensionRegistry<C: Sync> {
 }
 
 impl<C: Sync> ExtensionRegistry<C> {
+    /// Returns the host seam without enabling Voice mode or changing authority.
+    pub fn voice_admission(&self) -> Option<Arc<dyn VoiceAdmission>> {
+        self.voice_admission.clone()
+    }
+
     /// Acquires the host's turn-start permit, or an empty permit for ungated hosts.
     /// A missing permit rejects the start before Core consumes pending input.
     pub fn admit_turn_start(&self) -> Option<Box<dyn Send>> {

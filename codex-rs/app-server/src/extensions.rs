@@ -36,6 +36,9 @@ use crate::outgoing_message::ThreadScopedOutgoingMessageSender;
 use crate::thread_state::ThreadListenerCommand;
 use crate::thread_state::ThreadStateManager;
 
+#[path = "voice_admission.rs"]
+mod voice_admission;
+
 pub(crate) struct ThreadExtensionDependencies {
     pub(crate) event_sink: Arc<dyn ExtensionEventSink>,
     pub(crate) auth_manager: Arc<AuthManager>,
@@ -78,6 +81,9 @@ where
         builder.turn_start_admission(admission);
     }
     if let Some(queue_service) = queue_service {
+        builder.voice_admission(Arc::new(voice_admission::QueueVoiceAdmission(
+            Arc::clone(&queue_service),
+        )));
         codex_queue_extension::install(&mut builder, queue_service);
     }
     codex_history_notes_extension::install(&mut builder, auth_manager.clone());

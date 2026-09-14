@@ -5,6 +5,13 @@ mod session_isolation;
 mod state;
 mod turn_admission;
 mod user_instructions;
+mod voice_admission;
+
+pub use voice_admission::VoiceAdmission;
+pub use voice_admission::VoiceAdmissionAck;
+pub use voice_admission::VoiceAdmissionFuture;
+pub use voice_admission::VoiceAdmissionInput;
+pub use voice_admission::VoiceAdmissionScope;
 
 pub use session_isolation::SessionIsolation;
 

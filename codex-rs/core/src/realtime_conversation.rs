@@ -6,6 +6,7 @@ use crate::context::RealtimeDelegationSource;
 use crate::realtime_context::build_realtime_startup_context;
 use crate::realtime_context::truncate_realtime_text_to_token_budget;
 use crate::realtime_prompt::prepare_realtime_backend_prompt;
+use crate::realtime_voice_admission::voice_admission_input;
 use crate::responses_metadata::THREAD_SOURCE_KEY;
 use crate::session::session::Session;
 use anyhow::Context;
@@ -32,6 +33,7 @@ use codex_api::map_api_error;
 use codex_config::config_toml::RealtimeWsMode;
 use codex_config::config_toml::RealtimeWsVersion;
 use codex_login::CodexAuth;
+use codex_extension_api::VoiceAdmissionScope;
 use codex_login::default_client::add_originator_header;
 use codex_login::default_client::default_headers;
 use codex_login::read_openai_api_key_from_env;
@@ -159,6 +161,25 @@ impl RealtimeHandoffAdmission {
             return;
         };
         self.retired.store(true, Ordering::Release);
+    }
+
+    async fn route_voice(
+        &self,
+        session: &Arc<Session>,
+        scope: &VoiceAdmissionScope,
+        handoff: &RealtimeHandoffRequested,
+        text: String,
+    ) -> Result<(), &'static str> {
+        let _permit = self.gate.acquire().await.map_err(|_| "Voice admission retired")?;
+        if self.retired.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let admission = session.services.extensions.voice_admission()
+            .ok_or("Durable Voice admission is unavailable; no start-or-steer fallback")?;
+        let input = voice_admission_input(session.thread_id(), scope, handoff, text)?;
+        admission.admit(input).await
+            .map_err(|_| "Durable Voice admission failed; no automatic retry")?;
+        Ok(())
     }
 }
 
@@ -1583,6 +1604,18 @@ async fn handle_start_inner(
         session_config,
         transport,
     } = prepared_start;
+    let voice_scope = sess.services.thread_extension_data.get::<VoiceAdmissionScope>();
+    if let Some(scope) = &voice_scope
+        && (scope.voice_session_generation == 0
+            || scope.voice_session_generation > i64::MAX as u64
+            || scope.native_session_id.is_empty()
+            || requested_realtime_session_id.as_deref() != Some(scope.native_session_id.as_str())
+            || sess.services.extensions.voice_admission().is_none())
+    {
+        return Err(CodexErr::InvalidRequest(
+            "Explicit Voice scope must match this session and a durable queue host".to_string(),
+        ));
+    }
     info!("starting realtime conversation");
     let (sdp, existing_call_id) = match transport {
         ConversationStartTransport::Websocket => (None, None),
@@ -1669,7 +1702,13 @@ async fn handle_start_inner(
             if let Some(text) = maybe_routed_text {
                 // The routed text can contain spoken prompts or workspace secrets.
                 debug!("[realtime-text] realtime conversation text output");
-                handoff_error = route_handoffs.route(&sess_clone, text).await.err();
+                handoff_error = match (&voice_scope, &event) {
+                    (Some(scope), RealtimeEvent::HandoffRequested(handoff)) => {
+                        route_handoffs.route_voice(&sess_clone, scope, handoff, text).await.err()
+                    }
+                    (None, _) => route_handoffs.route(&sess_clone, text).await.err(),
+                    (Some(_), _) => Some("Unsupported Voice origin; no implicit admission"),
+                };
             }
             sess_clone
                 .send_event_raw(ev(EventMsg::RealtimeConversationRealtime(
@@ -1683,6 +1722,7 @@ async fn handle_start_inner(
             }
         }
         if handoff_error.is_none()
+            && voice_scope.is_none()
             && let Ok(text) = transcript_tail_rx.recv().await
         {
             handoff_error = route_handoffs.route(&sess_clone, text).await.err();

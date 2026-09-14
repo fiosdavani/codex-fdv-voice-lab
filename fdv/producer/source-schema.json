@@ -1,0 +1,17 @@
+{
+  "scope": "REAL_SOURCE_DDL_ONLY_NO_PERSONAL_TEXT",
+  "source_path": "/home/vanius_astra/.codex/thread_history_1.sqlite",
+  "sqlite_version": "3.45.1",
+  "source_access": "URI_MODE_RO_QUERY_ONLY_BEGIN_NO_IMMUTABLE",
+  "schema_sha256": "8c8e2208d0a818b0e3d2167edb986baf3404d2ab8ed74d86089146f904cc1f8e",
+  "tables": [
+    {
+      "name": "thread_items",
+      "sql": "CREATE TABLE thread_items (\n    thread_id TEXT NOT NULL,\n    turn_id TEXT NOT NULL,\n    item_id TEXT NOT NULL,\n    rollout_ordinal INTEGER NOT NULL,\n    created_at_ms INTEGER NOT NULL,\n    item_json TEXT NOT NULL, item_type TEXT NOT NULL DEFAULT '', updated_at_ordinal INTEGER NOT NULL DEFAULT 0,\n    PRIMARY KEY (thread_id, turn_id, item_id)\n)"
+    },
+    {
+      "name": "thread_turns",
+      "sql": "CREATE TABLE thread_turns (\n    thread_id TEXT NOT NULL,\n    turn_id TEXT NOT NULL,\n    rollout_ordinal INTEGER NOT NULL,\n    status TEXT NOT NULL,\n    error_json TEXT,\n    started_at INTEGER,\n    completed_at INTEGER,\n    duration_ms INTEGER,\n    first_user_item_id TEXT,\n    final_agent_item_id TEXT, rollout_byte_offset INTEGER, rollout_end_ordinal INTEGER, rollout_end_byte_offset INTEGER,\n    PRIMARY KEY (thread_id, turn_id)\n)"
+    }
+  ]
+}

@@ -1,0 +1,17 @@
+{
+  "schema": "fdv.source.client-id.shape-observation.v1",
+  "observed_date_utc": "2026-09-14",
+  "source_access": "URI_MODE_RO_QUERY_ONLY_BEGIN_NO_IMMUTABLE",
+  "source": "/home/vanius_astra/.codex/thread_history_1.sqlite",
+  "scope": "READ_ONLY_SOURCE_SHAPE_NO_PERSONAL_TEXT_OUTPUT",
+  "completed_pointer_rows_observed": 94,
+  "first_user_type_userMessage": 94,
+  "first_user_id_matches_turn_pointer": 94,
+  "clientId_camel_key_present": 94,
+  "client_id_snake_key_present": 0,
+  "clientId_value_types": {"string": 70, "null": 24},
+  "first_user_key_set": ["clientId", "content", "id", "type"],
+  "voice_origin_inferred_from_clientId": false,
+  "body_or_identifier_values_disclosed": false,
+  "new_receipt_producer_proved_by_this_observation": false
+}

@@ -1,0 +1,73 @@
+{
+  "schema": "fdv.producer.admission.manifest.v1",
+  "self_excluded": true,
+  "sqlite_files_included": false,
+  "original_private_text_included": false,
+  "files": [
+    {
+      "name": "ADMISSION-CONTRACT.md",
+      "sha256": "c770fd701f3407268594a31d3544a6847c0e3a06b78f464f8ca4d115e3bad883",
+      "bytes": 7224
+    },
+    {
+      "name": "CLIENT-ID-SHAPE-OBSERVATION.json",
+      "sha256": "06df739207baadd176f58c97d02a90a9db08d5fe8d70b2e89d399579f674a7de",
+      "bytes": 754
+    },
+    {
+      "name": "PRESERVATION-RECEIPT.json",
+      "sha256": "7a365216126d632878e9a38aaff632975eb3940cc1700a03504ef153380af88f",
+      "bytes": 195
+    },
+    {
+      "name": "admission_gate.py",
+      "sha256": "a7b0718ea9d042c3029d7cbdf0a791883256d22a2efb3b673249413f2ad55943",
+      "bytes": 7806
+    },
+    {
+      "name": "final_producer.py",
+      "sha256": "7843d6e3bf51c9a903f43c81d16f01363622f231c7229b3f023d7e4875e8e689",
+      "bytes": 22101
+    },
+    {
+      "name": "final_producer_base.py",
+      "sha256": "3d62a2b36d96eeda16b9ec50eda1b02ef2ee351e8cb2b054ecb7d83362b51f57",
+      "bytes": 17006
+    },
+    {
+      "name": "source-schema.json",
+      "sha256": "b3a68a9ed51f3cc0c48e6b25dfdfb55d953feaf060294b6a0c448eec4e3e6335",
+      "bytes": 1238
+    },
+    {
+      "name": "historical_freeze.json",
+      "sha256": "7a7c48d0c9d67b4f1e281306264b40e240d7c51e380a5cff6ec0aaf0df624bcb",
+      "bytes": 36895
+    },
+    {
+      "name": "test_admission.py",
+      "sha256": "0ba5f4ee098405cc954f3868abb53e920f0a5a7651e267c6dcf83a9d05aefecd",
+      "bytes": 16883
+    },
+    {
+      "name": "test_producer.py",
+      "sha256": "747b2ffb69aef49c22714073fa3b68b70799f226305904b7e380c795357d13c9",
+      "bytes": 19225
+    },
+    {
+      "name": "crash_worker.py",
+      "sha256": "411f61cd0cb56e0fe60d925c80446ea6054a686985c674fe2c2c837654855ad1",
+      "bytes": 1717
+    },
+    {
+      "name": "admission-tests-4e11c4ed665b4ed0b59237b7eb1d07a2/TEST-RECEIPT.json",
+      "sha256": "a7b4ae1984b107ebaa7af6ae57536d6704e21f49530d7e9c5975cef96713da47",
+      "bytes": 2960
+    },
+    {
+      "name": "tests-5b3bf7a0501e4e92a565c5aea9797f0a/TEST-RECEIPT.json",
+      "sha256": "8be7abe6ed49d3215b47889bdf735668d322cceceb7b9c61318cee1c55f570bb",
+      "bytes": 2830
+    }
+  ]
+}

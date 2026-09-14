@@ -6,6 +6,7 @@ use std::sync::Weak;
 use std::time::Duration;
 
 use codex_core::CodexThread;
+use codex_core::NotSubmittedReason;
 use codex_core::StartIfIdleSubmission;
 use codex_core::ThreadManager;
 use codex_core::TurnInput;
@@ -31,6 +32,10 @@ use codex_thread_store::MAX_QUEUE_ITEMS;
 use codex_thread_store::QueueStore;
 use codex_thread_store::QueuedUserSubmissionRecord;
 use codex_thread_store::ThreadStoreError;
+use codex_thread_store::VoiceAdmissionReceipt;
+use codex_thread_store::VoiceClaimOutcome;
+use codex_thread_store::VoiceEnqueueOutcome;
+use codex_thread_store::VoiceQueueOrigin;
 use thiserror::Error;
 use tokio::sync::Mutex;
 use tokio::sync::OwnedMutexGuard;
@@ -60,6 +65,10 @@ pub enum QueueServiceError {
         "queued user input exceeds the maximum length of {MAX_USER_INPUT_TEXT_CHARS} characters ({actual_chars} provided)"
     )]
     InputTooLarge { actual_chars: usize },
+    #[error("voice admission is already claimed or requires reconciliation")]
+    VoiceAdmissionBlocked,
+    #[error("voice queued input is immutable")]
+    VoiceInputImmutable,
 }
 
 #[derive(Clone)]
@@ -279,6 +288,71 @@ impl QueuedItemService {
         Ok(item)
     }
 
+    /// Enqueue a completed utterance once. Duplicate origins never wake dispatch.
+    pub async fn enqueue_voice(
+        &self,
+        thread_id: ThreadId,
+        mut input: TurnInput,
+        origin: VoiceQueueOrigin,
+    ) -> Result<VoiceAdmissionReceipt, QueueServiceError> {
+        if !self.queue.supports_voice_admission() {
+            return Err(ThreadStoreError::InvalidRequest {
+                message: "durable voice admission is unavailable".to_string(),
+            }.into());
+        }
+        let TurnInput::UserInput { client_id, .. } = &mut input else {
+            return Err(QueueServiceError::InvalidInput);
+        };
+        *client_id = Some(origin.origin_id.clone());
+        let input = prepare_queued_user_input(input).await?;
+        let payload = serde_json::to_string(&input)?;
+        let outcome = {
+            let _guard = self.dispatch_guard(thread_id).await;
+            let outcome = self.queue.enqueue_voice(thread_id, payload, origin).await?;
+            if matches!(&outcome, VoiceEnqueueOutcome::Inserted(_)) {
+                self.emit_changed(thread_id);
+            }
+            outcome
+        };
+        match outcome {
+            VoiceEnqueueOutcome::Existing(receipt) => Ok(receipt),
+            VoiceEnqueueOutcome::Inserted(receipt) => {
+                self.wake_if_loaded(thread_id).await;
+                self.get_voice_receipt(thread_id, receipt.origin_id).await?
+                    .ok_or(QueueServiceError::VoiceAdmissionBlocked)
+            }
+        }
+    }
+
+    pub async fn get_voice_receipt(
+        &self,
+        thread_id: ThreadId,
+        origin_id: String,
+    ) -> Result<Option<VoiceAdmissionReceipt>, QueueServiceError> {
+        Ok(self.queue.get_voice_receipt(thread_id, origin_id).await?)
+    }
+
+    /// The host must first verify a persisted user item with these exact IDs.
+    /// No-match, truncated history and unavailable history must remain blocked.
+    pub async fn reconcile_voice_started(
+        &self,
+        thread_id: ThreadId,
+        origin_id: String,
+        client_id: String,
+        turn_id: String,
+    ) -> Result<VoiceAdmissionReceipt, QueueServiceError> {
+        let receipt = {
+            let _guard = self.dispatch_guard(thread_id).await;
+            let receipt = self.queue.reconcile_voice_started(
+                thread_id, origin_id, client_id, turn_id,
+            ).await?;
+            self.emit_changed(thread_id);
+            receipt
+        };
+        self.wake_if_loaded(thread_id).await;
+        Ok(receipt)
+    }
+
     pub async fn list(&self, thread_id: ThreadId) -> Result<Vec<QueuedItem>, QueueServiceError> {
         self.list_page(thread_id, /*offset*/ 0, MAX_QUEUE_ITEMS)
             .await
@@ -305,6 +379,11 @@ impl QueuedItemService {
         mut input: TurnInput,
     ) -> Result<Option<QueuedItem>, QueueServiceError> {
         let _dispatch_guard = self.dispatch_guard(thread_id).await;
+        if self.queue.supports_voice_admission()
+            && self.queue.voice_receipt_for_item(thread_id, queued_item_id.clone()).await?.is_some()
+        {
+            return Err(QueueServiceError::VoiceInputImmutable);
+        }
         if let TurnInput::UserInput { client_id, .. } = &mut input {
             *client_id = self
                 .list(thread_id)
@@ -384,22 +463,70 @@ impl QueuedItemService {
                     |id| format!("queued submission not found: {id}"),
                 ),
             })?;
-        let queued_item_id = item.id.clone();
+        self.start_item_locked(thread, item, trace).await
+    }
+
+    // Both manual start and lifecycle dispatch hold the thread dispatch guard.
+    async fn start_item_locked(
+        &self,
+        thread: &CodexThread,
+        item: QueuedItem,
+        trace: Option<W3cTraceContext>,
+    ) -> Result<StartIfIdleSubmission, QueueServiceError> {
+        let thread_id = thread.session_configured().thread_id;
+        let queued_item_id = item.id;
         let input @ TurnInput::UserInput { .. } = item.input else {
             return Err(QueueServiceError::InvalidInput);
+        };
+        let tracked = self.queue.supports_voice_admission()
+            && self.queue.voice_receipt_for_item(thread_id, queued_item_id.clone()).await?.is_some();
+        let attempt_id = if tracked {
+            let attempt_id = Uuid::now_v7().to_string();
+            self.queue.claim_voice(thread_id, queued_item_id.clone(), attempt_id.clone()).await?
+                .ok_or(QueueServiceError::VoiceAdmissionBlocked)?;
+            Some(attempt_id)
+        } else {
+            None
         };
         let submission = thread
             .start_turn_if_idle(TurnInputRequest::new(input).with_trace(trace).on_start(
                 TurnStartOptions {
-                    turn_trigger: Some("queue".to_string()),
+                    turn_trigger: Some(if tracked { "realtime" } else { "queue" }.to_string()),
                     ..Default::default()
                 },
             ))
-            .await?;
-        if matches!(submission, StartIfIdleSubmission::Started { .. }) {
+            .await;
+        if let Some(attempt_id) = attempt_id {
+            let outcome = match &submission {
+                Ok(StartIfIdleSubmission::Started { turn_id }) => VoiceClaimOutcome::Started {
+                    turn_id: turn_id.clone(),
+                },
+                Ok(StartIfIdleSubmission::NotSubmitted { reason }) => match reason {
+                    NotSubmittedReason::NotIdle
+                    | NotSubmittedReason::PendingTriggerTurn
+                    | NotSubmittedReason::ServerDraining => VoiceClaimOutcome::RetryableRejection {
+                        reason: format!("{reason:?}"),
+                    },
+                    NotSubmittedReason::PlanMode
+                    | NotSubmittedReason::NoActiveTurn
+                    | NotSubmittedReason::ExpectedTurnMismatch { .. }
+                    | NotSubmittedReason::ActiveTurnNotSteerable { .. }
+                    | NotSubmittedReason::ActiveTurnOutputSchemaMismatch
+                    | NotSubmittedReason::EmptyInput => VoiceClaimOutcome::Rejected {
+                        reason: format!("{reason:?}"),
+                    },
+                },
+                Err(_) => VoiceClaimOutcome::Ambiguous {
+                    reason: "Core submission result is uncertain".to_string(),
+                },
+            };
+            // On failure the durable claim remains ineligible; never requeue it.
+            self.queue.finish_voice_claim(thread_id, queued_item_id, attempt_id, outcome).await?;
+            self.emit_changed(thread_id);
+        } else if matches!(&submission, Ok(StartIfIdleSubmission::Started { .. })) {
             self.delete_locked(thread_id, queued_item_id).await?;
         }
-        Ok(submission)
+        submission.map_err(QueueServiceError::CoreSubmissionError)
     }
 
     async fn dispatch_if_idle(&self, thread_id: ThreadId) -> Result<(), QueueServiceError> {
@@ -436,15 +563,15 @@ impl QueuedItemService {
                 continue;
             }
 
-            match thread
-                .start_turn_if_idle(TurnInputRequest::new(input).on_start(TurnStartOptions {
-                    turn_trigger: Some("queue".to_string()),
-                    ..Default::default()
-                }))
+            match self
+                .start_item_locked(
+                    thread.as_ref(),
+                    QueuedItem { id: queued_item_id.clone(), input },
+                    /*trace*/ None,
+                )
                 .await
             {
                 Ok(StartIfIdleSubmission::Started { .. }) => {
-                    self.delete_locked(thread_id, queued_item_id).await?;
                     return Ok(());
                 }
                 Ok(StartIfIdleSubmission::NotSubmitted { reason }) => {
