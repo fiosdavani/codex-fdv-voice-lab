@@ -1,0 +1,34 @@
+[
+  {
+    "crate": "codex-core",
+    "test_name": "realtime_conversation::voice_session::tests::generation_exhaustion_never_wraps_or_exceeds_javascript_safe_integer"
+  },
+  {
+    "crate": "codex-core",
+    "test_name": "realtime_conversation::voice_session::tests::provider_lifecycle_seals_before_admission_and_exports_immutable_scope"
+  },
+  {
+    "crate": "codex-core",
+    "test_name": "realtime_conversation::voice_session::tests::observer_rejection_never_seals_ready"
+  },
+  {
+    "crate": "codex-core",
+    "test_name": "realtime_conversation::voice_session::tests::retired_callbacks_cannot_bind_successor_with_reused_start_id"
+  },
+  {
+    "crate": "codex-core",
+    "test_name": "realtime_conversation::voice_session::tests::missing_or_invalid_provider_identity_never_enables_admission"
+  },
+  {
+    "crate": "codex-core",
+    "test_name": "realtime_conversation::voice_session::tests::failed_close_delivery_is_sticky_and_never_acknowledged_by_retry"
+  },
+  {
+    "crate": "codex-core",
+    "test_name": "realtime_conversation::strict_routing_tests::scoped_close_rejects_predecessor_after_successor_install"
+  },
+  {
+    "crate": "codex-core",
+    "test_name": "realtime_conversation::strict_routing_tests::native_close_waits_for_input_task_and_preserves_delivery_failure"
+  }
+]

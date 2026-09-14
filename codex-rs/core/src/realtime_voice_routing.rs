@@ -32,22 +32,45 @@ struct ReceivedOrigin {
 
 #[derive(Debug)]
 pub(crate) struct VoiceTurnRoutes {
-    scope: VoiceAdmissionScope,
+    scope: Option<VoiceAdmissionScope>,
     origins: HashMap<String, ReceivedOrigin>,
     turns: HashMap<String, VoiceTurnBinding>,
 }
 
 impl VoiceTurnRoutes {
+    #[cfg(test)]
     pub(crate) fn new(scope: VoiceAdmissionScope) -> Self {
         Self {
-            scope,
+            scope: Some(scope),
             origins: HashMap::new(),
             turns: HashMap::new(),
         }
     }
 
+    pub(crate) fn pending() -> Self {
+        Self {
+            scope: None,
+            origins: HashMap::new(),
+            turns: HashMap::new(),
+        }
+    }
+
+    pub(crate) fn seal(&mut self, scope: VoiceAdmissionScope) {
+        assert!(self.scope.is_none());
+        self.scope = Some(scope);
+    }
+
+    pub(crate) fn close(&mut self) {
+        for origin in self.origins.values_mut() {
+            origin.completed = true;
+            origin.output_cancellation.cancel();
+        }
+        self.turns.clear();
+        self.scope = None;
+    }
+
     pub(crate) fn received(&mut self, input: &VoiceAdmissionInput) -> Result<(), &'static str> {
-        if input.scope != self.scope {
+        if self.scope.as_ref() != Some(&input.scope) {
             return Err("Voice origin belongs to another native session");
         }
         let handoff_id = input
@@ -104,12 +127,13 @@ impl VoiceTurnRoutes {
         if self.turns.contains_key(turn_id) {
             return Err("Turn already belongs to another Voice origin");
         }
+        let scope = self.scope.as_ref().ok_or("Voice session is not sealed")?;
         origin.turn_id = Some(turn_id.to_string());
         self.turns.insert(
             turn_id.to_string(),
             VoiceTurnBinding {
-                native_session_id: self.scope.native_session_id.clone(),
-                voice_session_generation: self.scope.voice_session_generation,
+                native_session_id: scope.native_session_id.clone(),
+                voice_session_generation: scope.voice_session_generation,
                 turn_id: turn_id.to_string(),
                 origin_id: client_id.to_string(),
                 client_id: client_id.to_string(),

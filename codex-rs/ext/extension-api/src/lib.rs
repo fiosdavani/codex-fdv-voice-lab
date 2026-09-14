@@ -12,6 +12,11 @@ pub use voice_admission::VoiceAdmissionAck;
 pub use voice_admission::VoiceAdmissionFuture;
 pub use voice_admission::VoiceAdmissionInput;
 pub use voice_admission::VoiceAdmissionScope;
+pub use voice_admission::VoiceNativeSessionEvent;
+pub use voice_admission::VoiceNativeSessionFuture;
+pub use voice_admission::VoiceNativeSessionHooks;
+pub use voice_admission::VoiceNativeSessionObserver;
+pub use voice_admission::VoiceNativeSessionSignal;
 
 pub use session_isolation::SessionIsolation;
 

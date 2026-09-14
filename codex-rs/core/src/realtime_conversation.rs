@@ -35,6 +35,7 @@ use codex_config::config_toml::RealtimeWsMode;
 use codex_config::config_toml::RealtimeWsVersion;
 use codex_extension_api::VoiceAdmissionInput;
 use codex_extension_api::VoiceAdmissionScope;
+use codex_extension_api::VoiceNativeSessionHooks;
 use codex_login::CodexAuth;
 use codex_login::default_client::add_originator_header;
 use codex_login::default_client::default_headers;
@@ -91,10 +92,14 @@ use tracing::warn;
 mod bem;
 mod existing_call;
 mod sideband;
+#[path = "realtime_voice_session.rs"]
+mod voice_session;
 
 use self::bem::ChannelParser as BemChannelParser;
 use self::bem::message_phase as bem_message_phase;
 use self::sideband::spawn_webrtc_sideband_input_task;
+use self::voice_session::NativeVoiceSession;
+use self::voice_session::NativeVoiceSessionStart;
 
 const AUDIO_IN_QUEUE_CAPACITY: usize = 256;
 const TEXT_IN_QUEUE_CAPACITY: usize = 64;
@@ -197,6 +202,7 @@ impl RealtimeHandoffAdmission {
 }
 
 pub(crate) struct RealtimeConversationManager {
+    lifecycle_gate: Mutex<Option<String>>,
     state: Mutex<Option<ConversationState>>,
     mode_instructions: Mutex<Option<RealtimeModeInstructions>>,
 }
@@ -589,6 +595,7 @@ impl RealtimeHandoffState {
 
 #[allow(dead_code)]
 struct ConversationState {
+    native_voice: Option<Arc<NativeVoiceSession>>,
     audio_tx: Sender<RealtimeAudioFrame>,
     text_tx: Sender<ConversationTextParams>,
     session_kind: RealtimeSessionKind,
@@ -602,7 +609,7 @@ struct ConversationState {
 }
 
 struct RealtimeStart {
-    voice_scope: Option<VoiceAdmissionScope>,
+    voice_start: Option<NativeVoiceSessionStart>,
     api_provider: ApiProvider,
     realtime_sideband_base_url: Option<String>,
     extra_headers: Option<HeaderMap>,
@@ -620,6 +627,7 @@ struct RealtimeStart {
 }
 
 struct RealtimeStartOutput {
+    native_voice: Option<Arc<NativeVoiceSession>>,
     realtime_active: Arc<AtomicBool>,
     route_handoffs: Arc<RealtimeHandoffAdmission>,
     events_rx: Receiver<RealtimeEvent>,
@@ -631,6 +639,7 @@ struct RealtimeStartOutput {
 impl RealtimeConversationManager {
     pub(crate) fn new() -> Self {
         Self {
+            lifecycle_gate: Mutex::new(None),
             state: Mutex::new(None),
             mode_instructions: Mutex::new(None),
         }
@@ -678,25 +687,57 @@ impl RealtimeConversationManager {
 
     async fn start(
         &self,
-        start: RealtimeStart,
+        mut start: RealtimeStart,
         mode_instructions: RealtimeModeInstructions,
     ) -> CodexResult<RealtimeStartOutput> {
+        let mut lifecycle = self.lifecycle_gate.lock().await;
+        if let Some(error) = &*lifecycle {
+            return Err(CodexErr::InvalidRequest(error.clone()));
+        }
         let previous_state = {
             let mut guard = self.state.lock().await;
             guard.take()
         };
-        if let Some(state) = previous_state {
-            stop_conversation_state(state, RealtimeFanoutTaskStop::Await).await;
+        if let Some(state) = previous_state
+            && let Err(error) = stop_conversation_state(state, RealtimeFanoutTaskStop::Await).await
+        {
+            *lifecycle = Some(error.clone());
+            return Err(CodexErr::InvalidRequest(error));
         }
 
-        let output = self.start_inner(start).await?;
+        let native_voice = match start.voice_start.take() {
+            Some(voice_start) => match NativeVoiceSession::begin(voice_start).await {
+                Ok(native) => Some(native),
+                Err(error) => {
+                    *lifecycle = Some(error.clone());
+                    return Err(CodexErr::InvalidRequest(error));
+                }
+            },
+            None => None,
+        };
+        let output = match self.start_inner(start, native_voice.clone()).await {
+            Ok(output) => output,
+            Err(error) => {
+                if let Some(native_voice) = native_voice
+                    && let Err(close_error) = native_voice.close().await
+                {
+                    warn!("native Voice start failure close delivery failed: {close_error}");
+                    *lifecycle = Some(close_error);
+                }
+                return Err(error);
+            }
+        };
         *self.mode_instructions.lock().await = Some(mode_instructions);
         Ok(output)
     }
 
-    async fn start_inner(&self, start: RealtimeStart) -> CodexResult<RealtimeStartOutput> {
+    async fn start_inner(
+        &self,
+        start: RealtimeStart,
+        native_voice: Option<Arc<NativeVoiceSession>>,
+    ) -> CodexResult<RealtimeStartOutput> {
         let RealtimeStart {
-            voice_scope,
+            voice_start: _,
             api_provider,
             realtime_sideband_base_url,
             extra_headers,
@@ -734,8 +775,9 @@ impl RealtimeConversationManager {
         let handoff = RealtimeHandoffState {
             output_tx: handoff_output_tx,
             last_output: Arc::new(Mutex::new(HashMap::new())),
-            voice_routes: voice_scope
-                .map(|scope| Arc::new(Mutex::new(VoiceTurnRoutes::new(scope)))),
+            voice_routes: native_voice
+                .as_ref()
+                .map(|native| Arc::clone(&native.routes)),
             stream: Arc::new(Mutex::new(RealtimeHandoffStreamState::default())),
             client_managed_handoffs,
             codex_responses_as_items,
@@ -834,6 +876,7 @@ impl RealtimeConversationManager {
 
         let mut guard = self.state.lock().await;
         *guard = Some(ConversationState {
+            native_voice: native_voice.clone(),
             audio_tx,
             text_tx,
             session_kind,
@@ -845,6 +888,7 @@ impl RealtimeConversationManager {
             stop_token,
         });
         Ok(RealtimeStartOutput {
+            native_voice,
             realtime_active,
             route_handoffs,
             events_rx,
@@ -874,7 +918,8 @@ impl RealtimeConversationManager {
         }
     }
 
-    pub(crate) async fn finish_if_active(&self, realtime_active: &Arc<AtomicBool>) {
+    pub(crate) async fn finish_if_active(&self, realtime_active: &Arc<AtomicBool>) -> bool {
+        let mut lifecycle = self.lifecycle_gate.lock().await;
         let state = {
             let mut guard = self.state.lock().await;
             match guard.as_ref() {
@@ -883,9 +928,14 @@ impl RealtimeConversationManager {
             }
         };
 
-        if let Some(state) = state {
-            stop_conversation_state(state, RealtimeFanoutTaskStop::Detach).await;
+        let Some(state) = state else {
+            return false;
+        };
+        if let Err(error) = stop_conversation_state(state, RealtimeFanoutTaskStop::Detach).await {
+            *lifecycle = Some(error);
+            return false;
         }
+        true
     }
 
     pub(crate) async fn audio_in(&self, frame: RealtimeAudioFrame) -> CodexResult<()> {
@@ -1402,23 +1452,64 @@ impl RealtimeConversationManager {
     }
 
     pub(crate) async fn shutdown(&self) -> CodexResult<()> {
+        let mut lifecycle = self.lifecycle_gate.lock().await;
         let state = {
             let mut guard = self.state.lock().await;
             guard.take()
         };
 
-        if let Some(state) = state {
-            stop_conversation_state(state, RealtimeFanoutTaskStop::Await).await;
+        if let Some(state) = state
+            && let Err(error) = stop_conversation_state(state, RealtimeFanoutTaskStop::Await).await
+        {
+            *lifecycle = Some(error);
+        }
+        if let Some(error) = &*lifecycle {
+            return Err(CodexErr::InvalidRequest(error.clone()));
         }
         Ok(())
+    }
+
+    /// Candidate host hook. The public thread-only stop RPC does not call this
+    /// method and must not be presented as a scoped close acknowledgement.
+    pub(crate) async fn shutdown_native(
+        &self,
+        start_id: &str,
+        generation: u64,
+    ) -> Result<bool, String> {
+        let mut lifecycle = self.lifecycle_gate.lock().await;
+        if let Some(error) = &*lifecycle {
+            return Err(error.clone());
+        }
+        let state = {
+            let mut guard = self.state.lock().await;
+            if !guard
+                .as_ref()
+                .and_then(|state| state.native_voice.as_ref())
+                .is_some_and(|native| native.matches(start_id, generation))
+            {
+                return Ok(false);
+            }
+            guard.take()
+        };
+        if let Some(state) = state
+            && let Err(error) = stop_conversation_state(state, RealtimeFanoutTaskStop::Await).await
+        {
+            *lifecycle = Some(error.clone());
+            return Err(error);
+        }
+        Ok(true)
     }
 }
 
 async fn stop_conversation_state(
     mut state: ConversationState,
     fanout_task_stop: RealtimeFanoutTaskStop,
-) {
+) -> Result<(), String> {
     state.realtime_active.store(false, Ordering::Relaxed);
+    if let Some(native_voice) = &state.native_voice {
+        state.route_handoffs.retire().await;
+        native_voice.retire().await;
+    }
     state.stop_token.cancel();
     let _ = state.input_task.await;
 
@@ -1430,6 +1521,10 @@ async fn stop_conversation_state(
             RealtimeFanoutTaskStop::Detach => {}
         }
     }
+    if let Some(native_voice) = &state.native_voice {
+        native_voice.close().await?;
+    }
+    Ok(())
 }
 
 pub(crate) async fn handle_start(
@@ -1848,22 +1943,27 @@ async fn handle_start_inner(
         session_config,
         transport,
     } = prepared_start;
-    let voice_scope = sess
+    let voice_hooks = sess
+        .services
+        .thread_extension_data
+        .get::<VoiceNativeSessionHooks>();
+    if sess
         .services
         .thread_extension_data
         .get::<VoiceAdmissionScope>()
-        .map(|scope| (*scope).clone());
-    if let Some(scope) = &voice_scope
-        && (scope.voice_session_generation == 0
-            || scope.voice_session_generation > i64::MAX as u64
-            || scope.native_session_id.is_empty()
-            || client_managed_handoffs
+        .is_some()
+    {
+        return Err(CodexErr::InvalidRequest(
+            "Manual Voice scope cannot establish a native session lifecycle".to_string(),
+        ));
+    }
+    if voice_hooks.is_some()
+        && (client_managed_handoffs
             || codex_responses_as_items
-            || requested_realtime_session_id.as_deref() != Some(scope.native_session_id.as_str())
             || sess.services.extensions.voice_admission().is_none())
     {
         return Err(CodexErr::InvalidRequest(
-            "Explicit Voice scope must match this session and a durable queue host".to_string(),
+            "Native Voice requires Core handoffs and a durable queue host".to_string(),
         ));
     }
     info!("starting realtime conversation");
@@ -1877,7 +1977,11 @@ async fn handle_start_inner(
         end: realtime_end_instructions,
     };
     let start = RealtimeStart {
-        voice_scope: voice_scope.clone(),
+        voice_start: voice_hooks.map(|hooks| NativeVoiceSessionStart {
+            thread_id: sess.thread_id(),
+            start_id: sub_id.to_string(),
+            hooks: (*hooks).clone(),
+        }),
         api_provider,
         realtime_sideband_base_url,
         extra_headers,
@@ -1907,6 +2011,7 @@ async fn handle_start_inner(
     .await;
 
     let RealtimeStartOutput {
+        native_voice,
         realtime_active,
         route_handoffs,
         events_rx,
@@ -1933,6 +2038,16 @@ async fn handle_start_inner(
         let mut handoff_error = None;
         // Drain already-parsed events so a queued handoff is routed before the final tail.
         while let Ok(event) = events_rx.recv().await {
+            if let Some(native_voice) = &native_voice {
+                if !fanout_realtime_active.load(Ordering::Acquire) {
+                    break;
+                }
+                if let Err(error) = native_voice.observe(&event).await {
+                    warn!("native Voice lifecycle rejected provider event: {error}");
+                    handoff_error = Some("Native Voice lifecycle rejected provider event");
+                    break;
+                }
+            }
             match &event {
                 RealtimeEvent::AudioOut(_) => {}
                 _ => {
@@ -1953,11 +2068,16 @@ async fn handle_start_inner(
             if let Some(text) = maybe_routed_text {
                 // The routed text can contain spoken prompts or workspace secrets.
                 debug!("[realtime-text] realtime conversation text output");
-                handoff_error = match (&voice_scope, &event) {
-                    (Some(scope), RealtimeEvent::HandoffRequested(handoff)) => route_handoffs
-                        .route_voice(&sess_clone, scope, handoff, text)
-                        .await
-                        .err(),
+                handoff_error = match (&native_voice, &event) {
+                    (Some(native_voice), RealtimeEvent::HandoffRequested(handoff)) => {
+                        match native_voice.scope().await {
+                            Ok(scope) => route_handoffs
+                                .route_voice(&sess_clone, &scope, handoff, text)
+                                .await
+                                .err(),
+                            Err(error) => Some(error),
+                        }
+                    }
                     (None, _) => route_handoffs.route(&sess_clone, text).await.err(),
                     (Some(_), _) => Some("Unsupported Voice origin; no implicit admission"),
                 };
@@ -1974,7 +2094,7 @@ async fn handle_start_inner(
             }
         }
         if handoff_error.is_none()
-            && voice_scope.is_none()
+            && native_voice.is_none()
             && let Ok(text) = transcript_tail_rx.recv().await
         {
             handoff_error = route_handoffs.route(&sess_clone, text).await.err();
@@ -1996,11 +2116,18 @@ async fn handle_start_inner(
                 }
                 RealtimeConversationEnd::Requested | RealtimeConversationEnd::Error => {}
             }
-            sess_clone
-                .conversation
-                .finish_if_active(&fanout_realtime_active)
-                .await;
-            send_realtime_conversation_closed(&sess_clone, sub_id, end).await;
+            // Leave the fanout before acquiring the lifecycle gate: a concurrent
+            // start/stop holds that gate while awaiting this task. The captured
+            // identity is checked again by finish_if_active after acquisition.
+            tokio::spawn(async move {
+                if sess_clone
+                    .conversation
+                    .finish_if_active(&fanout_realtime_active)
+                    .await
+                {
+                    send_realtime_conversation_closed(&sess_clone, sub_id, end).await;
+                }
+            });
         }
     });
     sess.conversation
@@ -2925,7 +3052,11 @@ async fn end_realtime_conversation(
     sub_id: String,
     end: RealtimeConversationEnd,
 ) {
-    let _ = sess.conversation.shutdown().await;
+    if let Err(error) = sess.conversation.shutdown().await {
+        send_conversation_error(sess, sub_id, error.to_string(), CodexErrorInfo::BadRequest)
+            .await;
+        return;
+    }
     send_realtime_conversation_closed(sess, sub_id, end).await;
 }
 

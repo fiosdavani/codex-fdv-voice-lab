@@ -69,7 +69,7 @@ impl<C: Sync> ExtensionRegistryBuilder<C> {
         self.registry.turn_start_admission = Some(admission);
     }
 
-    /// Supplies the durable host seam; only explicit VoiceAdmissionScope uses it.
+    /// Supplies the durable host seam; only explicit VoiceNativeSessionHooks uses it.
     pub fn voice_admission(&mut self, admission: Arc<dyn VoiceAdmission>) {
         self.registry.voice_admission = Some(admission);
     }

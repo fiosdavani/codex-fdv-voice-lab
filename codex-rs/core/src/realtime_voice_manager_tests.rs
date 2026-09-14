@@ -5,6 +5,101 @@ use super::*;
 use codex_protocol::ThreadId;
 use pretty_assertions::assert_eq;
 
+#[derive(Default)]
+struct NativeObserver {
+    signals: std::sync::Mutex<Vec<codex_extension_api::VoiceNativeSessionSignal>>,
+    input_stopped: Option<Arc<AtomicBool>>,
+    reject_closed: bool,
+}
+
+impl codex_extension_api::VoiceNativeSessionObserver for NativeObserver {
+    fn emit(&self, signal: codex_extension_api::VoiceNativeSessionSignal) -> codex_extension_api::VoiceNativeSessionFuture<'_> {
+        Box::pin(async move {
+            let closing = matches!(&signal.event, codex_extension_api::VoiceNativeSessionEvent::Closed { .. });
+            if closing && let Some(stopped) = &self.input_stopped {
+                assert!(stopped.load(Ordering::Acquire), "Closed must follow input task termination");
+            }
+            self.signals.lock().unwrap().push(signal);
+            if closing && self.reject_closed {
+                return Err("close delivery failed".into());
+            }
+            Ok(())
+        })
+    }
+}
+
+#[tokio::test]
+async fn scoped_close_rejects_predecessor_after_successor_install() {
+    let observer = Arc::new(NativeObserver::default());
+    let thread_id = ThreadId::new();
+    let old = NativeVoiceSession::begin(NativeVoiceSessionStart {
+        thread_id, start_id: "same-start-id".into(), hooks: VoiceNativeSessionHooks(observer.clone()),
+    }).await.unwrap();
+    let provider = |id: &str| RealtimeEvent::SessionUpdated {
+        realtime_session_id: id.into(), instructions: None,
+    };
+    old.observe(&provider("provider-A")).await.unwrap();
+    let old_scope = old.scope().await.unwrap();
+    old.close().await.unwrap();
+    let successor = NativeVoiceSession::begin(NativeVoiceSessionStart {
+        thread_id, start_id: "same-start-id".into(), hooks: VoiceNativeSessionHooks(observer.clone()),
+    }).await.unwrap();
+    successor.observe(&provider("provider-B")).await.unwrap();
+    let scope = successor.scope().await.unwrap();
+    let (manager, _, _, _) = manager(RealtimeEventParser::RealtimeV2).await;
+    {
+        let mut state = manager.state.lock().await;
+        let state = state.as_mut().unwrap();
+        state.native_voice = Some(successor.clone());
+        state.handoff.voice_routes = Some(successor.routes.clone());
+    }
+    assert_eq!(manager.shutdown_native("same-start-id", old_scope.voice_session_generation).await, Ok(false));
+    assert_eq!(successor.scope().await.unwrap(), scope);
+    let input = voice_admission_input(thread_id, &scope, &handoff("B"), "words B".into()).unwrap();
+    manager.remember_voice_origin(&input).await.unwrap();
+    manager.activate_voice_turn("turn-B", Some(&input.origin_id)).await.unwrap();
+    let cancellation = successor.routes.lock().await.output_route("turn-B").unwrap().1;
+    assert_eq!(manager.shutdown_native("same-start-id", scope.voice_session_generation).await, Ok(true));
+    assert!(cancellation.is_cancelled());
+    assert!(manager.running_state().await.is_none());
+    assert_eq!(manager.shutdown_native("same-start-id", scope.voice_session_generation).await, Ok(false));
+    assert_eq!(observer.signals.lock().unwrap().iter().filter(|signal|
+        matches!(&signal.event, codex_extension_api::VoiceNativeSessionEvent::Closed { .. })).count(), 2);
+}
+
+#[tokio::test]
+async fn native_close_waits_for_input_task_and_preserves_delivery_failure() {
+    let stopped = Arc::new(AtomicBool::new(false));
+    let observer = Arc::new(NativeObserver {
+        input_stopped: Some(stopped.clone()), reject_closed: true, ..Default::default()
+    });
+    let native = NativeVoiceSession::begin(NativeVoiceSessionStart {
+        thread_id: ThreadId::new(), start_id: "start".into(), hooks: VoiceNativeSessionHooks(observer.clone()),
+    }).await.unwrap();
+    native.observe(&RealtimeEvent::SessionUpdated {
+        realtime_session_id: "provider-A".into(), instructions: None,
+    }).await.unwrap();
+    let scope = native.scope().await.unwrap();
+    let (manager, _, _, _) = manager(RealtimeEventParser::RealtimeV2).await;
+    {
+        let mut state = manager.state.lock().await;
+        let state = state.as_mut().unwrap();
+        state.native_voice = Some(native);
+        let stop_token = state.stop_token.clone();
+        state.input_task = tokio::spawn(async move {
+            stop_token.cancelled().await;
+            stopped.store(true, Ordering::Release);
+        });
+    }
+    assert_eq!(manager.shutdown_native("start", scope.voice_session_generation).await,
+        Err("close delivery failed".into()));
+    assert_eq!(manager.shutdown_native("start", scope.voice_session_generation).await,
+        Err("close delivery failed".into()));
+    assert_eq!(*manager.lifecycle_gate.lock().await, Some("close delivery failed".into()));
+    assert_eq!(observer.signals.lock().unwrap().iter().filter(|signal|
+        matches!(&signal.event, codex_extension_api::VoiceNativeSessionEvent::Closed { .. })).count(), 1);
+}
+
 fn aborted_event() -> EventMsg {
     EventMsg::TurnAborted(codex_protocol::protocol::TurnAbortedEvent {
         // The dispatcher must use the TurnContext argument, not this optional ID.
@@ -86,7 +181,9 @@ async fn manager(
     let (audio_tx, _) = async_channel::bounded(1);
     let (text_tx, _) = async_channel::bounded(1);
     let manager = RealtimeConversationManager {
+        lifecycle_gate: Mutex::new(None),
         state: Mutex::new(Some(ConversationState {
+            native_voice: None,
             audio_tx,
             text_tx,
             session_kind,
