@@ -26,6 +26,7 @@ impl VoiceAdmission for QueueVoiceAdmission {
                     client_id: Some(input.origin_id.clone()),
                 },
                 VoiceQueueOrigin {
+                    native_session_id: input.scope.native_session_id,
                     voice_session_generation: input.scope.voice_session_generation,
                     origin_id: input.origin_id,
                     handoff_id: input.handoff_id,

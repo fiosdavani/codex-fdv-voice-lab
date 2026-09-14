@@ -8,6 +8,7 @@ use sqlx::sqlite::SqliteRow;
 /// An opaque provider utterance key, already scoped by the caller to its origin.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VoiceQueueOrigin {
+    pub native_session_id: String,
     pub voice_session_generation: u64,
     pub origin_id: String,
     pub handoff_id: Option<String>,
@@ -29,6 +30,7 @@ pub enum VoiceAdmissionResult {
 pub struct VoiceAdmissionReceipt {
     pub schema: String,
     pub thread_id: ThreadId,
+    pub native_session_id: String,
     pub voice_session_generation: u64,
     pub origin_id: String,
     pub handoff_id: Option<String>,
@@ -71,10 +73,15 @@ impl VoiceAdmissionReceipt {
             "Cancelled" => VoiceAdmissionResult::Cancelled,
             _ => anyhow::bail!("invalid voice admission state"),
         };
+        let native_session_id: Option<String> = row.try_get("native_session_id")?;
+        let native_session_id = native_session_id
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| anyhow::anyhow!("voice receipt has no native session binding"))?;
         let queued_item_id: String = row.try_get("queued_item_id")?;
         Ok(Self {
             schema: "fdv.voice.admission.v1".to_string(),
             thread_id: ThreadId::try_from(row.try_get::<String, _>("thread_id")?)?,
+            native_session_id,
             voice_session_generation: u64::try_from(row.try_get::<i64, _>("voice_session_generation")?)?,
             origin_id: row.try_get("origin_id")?,
             handoff_id: row.try_get("handoff_id")?,

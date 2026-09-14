@@ -77,12 +77,17 @@ async fn voice_manual_and_idle_dispatch_share_durable_receipts() -> anyhow::Resu
     let queue = loaded_thread_queue(&test)?;
     let staged = QueuedItemService::new(Arc::clone(&queue), Weak::new(), Arc::new(NoopExtensionEventSink));
     let origin = VoiceQueueOrigin {
+        native_session_id: "native-session-A".to_string(),
         voice_session_generation: 1,
         origin_id: "voice-generation-nonce/utterance-1".to_string(),
         handoff_id: Some("handoff".to_string()),
         item_id: Some("item".to_string()),
     };
     let queued = staged.enqueue_voice(thread_id, user_input("one utterance"), origin.clone()).await?;
+    assert_eq!(origin.native_session_id, queued.native_session_id);
+    let mut wrong_session = origin.clone();
+    wrong_session.native_session_id = "native-session-B".to_string();
+    assert!(staged.enqueue_voice(thread_id, user_input("one utterance"), wrong_session).await.is_err());
     assert_eq!(queued, staged.enqueue_voice(thread_id, user_input("one utterance"), origin.clone()).await?);
     assert!(staged.enqueue_voice(thread_id, user_input("conflicting utterance"), origin.clone()).await.is_err());
     assert!(matches!(staged.update(thread_id, queued.queued_item_id.clone(), user_input("changed")).await,

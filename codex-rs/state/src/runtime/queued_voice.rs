@@ -13,9 +13,9 @@ use uuid::Uuid;
 // statements used by Rust, rather than a second implementation of the queue.
 const ENQUEUE_VOICE_RECEIPT_SQL: &str = r#"
 INSERT INTO voice_admission_receipts (
-    thread_id, origin_id, voice_session_generation, handoff_id, item_id,
+    thread_id, origin_id, native_session_id, voice_session_generation, handoff_id, item_id,
     queued_item_id, client_id, payload_json, admission_result
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Queued')
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'Queued')
 ON CONFLICT(thread_id, origin_id) DO NOTHING
 "#;
 const ENQUEUE_VOICE_ITEM_SQL: &str = r#"
@@ -30,6 +30,7 @@ const GET_VOICE_ITEM_RECEIPT_SQL: &str =
 const CLAIM_VOICE_SQL: &str = r#"
 UPDATE voice_admission_receipts SET admission_result = 'Claimed', attempt_id = ?, reason = NULL
 WHERE thread_id = ? AND queued_item_id = ? AND admission_result = 'Queued'
+AND native_session_id IS NOT NULL AND length(trim(native_session_id)) > 0
 AND EXISTS (
     SELECT 1 FROM queued_items WHERE id = queued_item_id
       AND thread_id = voice_admission_receipts.thread_id
@@ -46,13 +47,15 @@ const FINISH_VOICE_CLAIM_SQL: &str = r#"
 UPDATE voice_admission_receipts
 SET admission_result = ?, turn_id = ?, reason = ?, attempt_id = ?
 WHERE thread_id = ? AND queued_item_id = ? AND admission_result = 'Claimed' AND attempt_id = ?
+AND native_session_id IS NOT NULL AND length(trim(native_session_id)) > 0
 RETURNING *
 "#;
 const REMOVE_VOICE_ITEM_SQL: &str =
     "DELETE FROM queued_items WHERE thread_id = ? AND id = ?";
 const RECONCILE_VOICE_STARTED_SQL: &str = r#"
 UPDATE voice_admission_receipts SET admission_result = 'Started', turn_id = ?, reason = NULL
-WHERE thread_id = ? AND origin_id = ? AND client_id = ?
+WHERE thread_id = ? AND native_session_id = ? AND origin_id = ? AND client_id = ?
+AND length(trim(native_session_id)) > 0
 AND (admission_result IN ('Claimed', 'Ambiguous') OR (admission_result = 'Started' AND turn_id = ?))
 RETURNING *
 "#;
@@ -66,6 +69,7 @@ impl SqliteQueueStore {
         origin: &VoiceQueueOrigin,
     ) -> anyhow::Result<VoiceEnqueueOutcome> {
         anyhow::ensure!(!origin.origin_id.is_empty(), "voice origin id is empty");
+        anyhow::ensure!(!origin.native_session_id.trim().is_empty(), "native session id is empty");
         anyhow::ensure!(origin.voice_session_generation > 0, "invalid voice generation");
         let input: serde_json::Value = serde_json::from_str(payload_json)?;
         anyhow::ensure!(
@@ -80,6 +84,7 @@ impl SqliteQueueStore {
         let inserted = sqlx::query(ENQUEUE_VOICE_RECEIPT_SQL)
             .bind(thread_id.to_string())
             .bind(&origin.origin_id)
+            .bind(&origin.native_session_id)
             .bind(generation)
             .bind(&origin.handoff_id)
             .bind(&origin.item_id)
@@ -97,6 +102,7 @@ impl SqliteQueueStore {
         let receipt = VoiceAdmissionReceipt::try_from_row(&row)?;
         anyhow::ensure!(
             row.try_get::<String, _>("payload_json")? == payload_json
+                && receipt.native_session_id == origin.native_session_id
                 && receipt.voice_session_generation == origin.voice_session_generation
                 && receipt.handoff_id == origin.handoff_id
                 && receipt.item_id == origin.item_id,
@@ -222,16 +228,19 @@ impl SqliteQueueStore {
     pub async fn reconcile_voice_started(
         &self,
         thread_id: ThreadId,
+        native_session_id: &str,
         origin_id: &str,
         client_id: &str,
         turn_id: &str,
     ) -> anyhow::Result<VoiceAdmissionReceipt> {
         anyhow::ensure!(!turn_id.is_empty(), "voice turn id is empty");
         anyhow::ensure!(client_id == origin_id, "voice reconciliation client id mismatch");
+        anyhow::ensure!(!native_session_id.trim().is_empty(), "native session id is empty");
         let mut transaction = self.pool.begin().await?;
         let row = sqlx::query(RECONCILE_VOICE_STARTED_SQL)
             .bind(turn_id)
             .bind(thread_id.to_string())
+            .bind(native_session_id)
             .bind(origin_id)
             .bind(client_id)
             .bind(turn_id)

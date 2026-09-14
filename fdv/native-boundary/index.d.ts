@@ -39,6 +39,7 @@ export interface JobFenceRequest extends AdapterRequest {
  */
 export interface NativeBoundaryAdapter {
   readonly kind: AdapterKind;
+  observeLiveSession(request: AdapterRequest): Promise<Acknowledgement & { readonly type: 'LIVE_SESSION_ACK'; readonly active: true; readonly ownerCurrent: true; readonly outputMuted: true; readonly observation: 'SESSION_AND_SINK_READBACK' }>;
   setOutputMuted(request: AdapterRequest & { readonly muted: true }): Promise<OutputMutedAck>;
   playNativeOutput(request: AdapterRequest & { readonly requiredMuted: true; readonly mutedOperationId: string }): Promise<Acknowledgement & { readonly type: 'NATIVE_OUTPUT_PLAY_ACK'; readonly muted: true }>;
   invalidateJobs(request: JobFenceRequest): Promise<Acknowledgement & { readonly type: 'JOBS_INVALIDATED_ACK'; readonly jobGeneration: number }>;
@@ -78,6 +79,31 @@ export interface BoundaryEvent {
   readonly adapterKind: AdapterKind;
   readonly [key: string]: unknown;
 }
+export interface PlaybackIdentity {
+  readonly thread_id: string;
+  readonly native_session_id: string;
+  readonly voice_session_generation: number;
+  readonly origin_id: string;
+  readonly client_id: string;
+  readonly queued_item_id: string;
+  readonly turn_id: string;
+  readonly final_agent_item_id: string;
+  readonly first_user_item_id: string;
+  readonly job_generation: number;
+  readonly text_sha256: string;
+  readonly receipt_sha256: string;
+}
+export interface CombinedPlaybackDecision {
+  readonly status: 'HOLD' | 'READY_FOR_TTS';
+  readonly readyForTts: boolean;
+  readonly egressAuthorized: false;
+  readonly reason?: string;
+  readonly authorizationOnly?: true;
+  readonly executionScope?: 'OFFLINE_FAKE' | 'NATIVE_ADAPTER_UNATTESTED';
+  readonly identity?: PlaybackIdentity;
+  readonly scope?: VoiceScope;
+  readonly jobGeneration?: number;
+}
 export interface NativeVoiceBoundary {
   beginSession(scope: VoiceScope): Promise<BoundaryResult>;
   playNativeOutput(scope: VoiceScope): Promise<BoundaryResult>;
@@ -91,6 +117,11 @@ export interface NativeVoiceBoundary {
     scope?: VoiceScope;
     jobGeneration?: number;
   };
+  /** Sole combined readiness decision; invoke again at actual play after delayed TTS.
+   * Reader must synchronously supply current trusted source+journal evidence.
+   * This offline candidate performs no TTS/player effect and emits no reusable token.
+   */
+  authorizeVaiPlayback(input: { scope: VoiceScope; readProducerEvidence: () => unknown }): Promise<CombinedPlaybackDecision>;
   snapshot(scope: VoiceScope): BoundarySnapshot | null;
   events(): BoundaryEvent[];
 }

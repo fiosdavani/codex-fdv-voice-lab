@@ -58,3 +58,38 @@ FDV_BOUNDARY_TEST_NEGATIVE=1 node --test test-native-boundary.mjs
 O último comando deve falhar por INTENTIONAL_NEGATIVE_CONTROL. Nesta versão Node20 a invocação `--test` apresentou resumo por arquivo; execução direta do mesmo node:test revelou os 30 cenários. O controle negativo prova que o arquivo não foi aceito sem executar assertions. `run-proof.py` salva stdout/stderr, rc e hashes nesta pasta em uma subpasta nova, sem tocar fontes externas. Resultados sintéticos não são prova de áudio real.
 
 Correção após revisão: a primeira bateria de 25 cenários exigia apenas detach/preservação no ACK, insuficiente para declarar composer utilizável. Esses recibos permanecem preservados; os seis arquivos anteriores estão congelados em `pre-composer-ack/`, somente evidência, não entrada do runner. A bateria atual acrescenta cinco cenários da pós-condição do composer, incluindo ausência de campos, falso pronto e backend ocupado legítimo. O hookup Windows continua NC.
+
+
+## Delta após revisão Sol — gate combinado
+
+`authorizeVaiPlayback({scope, readProducerEvidence})` é a única decisão combinada
+`READY_FOR_TTS`. `gateVaiJob` continua um fence necessário, sem authority de áudio.
+O método exige readback ativo do adapter da MESMA sessão nativa e owner, sink muted,
+prova atual do produtor relida depois do await e todos os joins thread/session/voice
+ generation/origin/client/turn/final/job generation. Não aceita um boolean PASS.
+
+`readProducerEvidence` deve ser um reader síncrono confiável da projeção corrente de
+fonte+journal, equivalente a `final_producer.read_playback_evidence` no domínio que
+detém essa leitura. O callback real entre Python e Desktop NÃO está implementado;
+nestes testes ele fornece fixtures extraídas de SQLite sintético. Hash de snapshot
+é integridade, não autenticação de autor/owner. O readback native também é FAKE.
+
+Onset/close durante o await e durante reader reentrante são novamente confrontados
+antes da decisão. Uma geração de job antiga não pode ser renovada por autorização
+nova. Os 93 thread/turn históricos são bloqueados novamente por ledger SHA fixo.
+
+Esta candidata não chama TTS nem player VAI. `egressAuthorized=false` e a decisão
+não é token reutilizável. O futuro consumer deve invocar esse gate imediatamente
+antes do efeito e novamente ao receber TTS/master atrasado; adapter deve fencear
+scope antes de cada efeito. Não há alegação de atomicidade entre processos ou
+Desktop, nem de autenticação de packet JSON arbitrário fornecido por caller.
+
+Novo método obrigatório do adapter: `observeLiveSession` retorna `LIVE_SESSION_ACK`
+com request operationId/scope, active=true, ownerCurrent=true, outputMuted=true e
+observation=SESSION_AND_SINK_READBACK. Sua implementação instalada permanece NC.
+
+`run-proof.py` mede 30 cenários da boundary anterior e 30 do gate combinado, com
+controles negativos de ambos os runners e contagens TAP explícitas. O stdout do
+`node --test` nesta bancada resume um arquivo; não é usado como contagem de casos.
+A declaração TypeScript anterior teve PASS externo informado pela Sol; o delta
+novo ainda precisa de tsc. Nenhum Windows/Voice/ElevenLabs nesta rodada.

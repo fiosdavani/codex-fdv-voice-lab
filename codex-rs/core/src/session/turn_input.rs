@@ -436,6 +436,10 @@ async fn start_if_idle(
         .maybe_emit_model_warnings_for_turn(turn_context.as_ref())
         .await;
 
+    let voice_client_id = match &input {
+        SubmittedTurnInput::UserInput { client_id, .. } => client_id.clone(),
+        _ => None,
+    };
     let mut task_input = merge_additional_context_input(session, additional_context).await;
     match kind {
         TurnStartKind::User => {
@@ -460,6 +464,14 @@ async fn start_if_idle(
         TurnStartKind::Recovery => {
             // Recovery resumes an existing turn without a new empty user message.
         }
+    }
+    // Bind after Core accepts StartIfIdle, before any task/output can execute.
+    // Host queue receipt publication happens later and is too late for routing.
+    if let Err(error) = session.conversation
+        .activate_voice_turn(&submission_id, voice_client_id.as_deref()).await
+    {
+        session.clear_reserved_idle_turn(&turn_state).await;
+        return Err(CodexErr::InvalidRequest(error.to_string()));
     }
     session
         .start_task(turn_context, task_input, RegularTask::new())

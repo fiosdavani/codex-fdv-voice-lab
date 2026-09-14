@@ -12,7 +12,7 @@ import uuid
 
 from admission_gate import evaluate_final_admission, frozen_turns, parse_freeze
 from final_producer import (ROOT, canonical, connect_source, poll_once,
-                            read_snapshot, sha, write_receipt)
+                            read_playback_evidence, read_snapshot, sha, write_receipt)
 
 sys.dont_write_bytecode = True
 RUN = ROOT / ('admission-tests-' + uuid.uuid4().hex)
@@ -42,13 +42,14 @@ def case(name):
 def contracts(thread='FAKE_THREAD', turn='FAKE_TURN', generation=1, input_digest=None):
     origin = 'opaque_origin_without_generation_syntax'
     receipt = {'schema': 'fdv.voice.admission.v1', 'receipt_id': 'FAKE_QUEUE',
-               'thread_id': thread, 'voice_session_generation': generation,
+               'thread_id': thread, 'native_session_id': 'FAKE_NATIVE_SESSION',
+               'voice_session_generation': generation,
                'origin_id': origin, 'handoff_id': None, 'item_id': None,
                'client_id': origin, 'queued_item_id': 'FAKE_QUEUE',
                'turn_id': turn, 'admission_result': 'Started',
                'attempt_id': 'FAKE_ATTEMPT', 'input_digest': input_digest}
-    auth = {'schema': 'fdv.voice.authorization.v1', 'state': 'Active',
-            **{k: receipt[k] for k in ('thread_id', 'voice_session_generation',
+    auth = {'schema': 'fdv.voice.authorization.v1', 'state': 'Active', 'job_generation': 0,
+            **{k: receipt[k] for k in ('thread_id', 'native_session_id', 'voice_session_generation',
                                       'origin_id', 'client_id', 'queued_item_id', 'input_digest')}}
     return receipt, auth
 
@@ -117,6 +118,7 @@ def _():
 @case('scope_mutations_in_receipt_cannot_authorize_backend_final')
 def _():
     mutations = {'thread_id': 'OTHER_THREAD', 'turn_id': 'OTHER_TURN',
+                 'native_session_id': 'WRONG_NATIVE_SESSION',
                  'voice_session_generation': 2, 'origin_id': 'OTHER_ORIGIN',
                  'client_id': 'OTHER_CLIENT', 'queued_item_id': 'OTHER_QUEUE',
                  'receipt_id': 'OTHER_RECEIPT', 'input_digest': 'OTHER_DIGEST',
@@ -144,7 +146,11 @@ def _():
                 {'voice_session_generation': '1'}, {'voice_session_generation': 2},
                 {'state': 'Revoked'}, {'state': 'Unknown'}, {'thread_id': 'OTHER_THREAD'},
                 {'client_id': 'OTHER_CLIENT'}, {'origin_id': 'OTHER_ORIGIN'},
-                {'queued_item_id': 'OTHER_QUEUE'}, {'schema': 'UNKNOWN'}]
+                {'queued_item_id': 'OTHER_QUEUE'}, {'schema': 'UNKNOWN'},
+                {'native_session_id': 'WRONG_NATIVE_SESSION'},
+                {'native_session_id': ''}, {'job_generation': -1},
+                {'job_generation': True}, {'job_generation': '0'},
+                {'job_generation': 9007199254740992}]
     for changes in variants:
         f, r, a, _ = fixture(); a.update(changes)
         check(poll(f, r, a)['fake_eligible_jobs'] == 0, 'invalid or different current authorization blocked')
@@ -284,6 +290,106 @@ def _():
     check(poll(f, r, a)['fake_eligible_jobs'] == 0, 'missing current source cannot retain eligibility')
     check(not json.loads(query(f, 'SELECT latest_decision_json FROM admission_audit')[0][0])['eligible_fake_only'],
           'audit cannot advertise stale eligibility after source disappears')
+
+
+
+@case('native_session_required_and_wrong_session_holds_same_thread_and_generation')
+def _():
+    for side in ('receipt', 'authorization'):
+        for value in (None, '', 'WRONG_NATIVE_SESSION'):
+            f, r, a, _ = fixture()
+            (r if side == 'receipt' else a)['native_session_id'] = value
+            check(poll(f, r, a)['fake_eligible_jobs'] == 0,
+                  'same thread/generation wrong or invalid native session holds')
+        f, r, a, _ = fixture(); del (r if side == 'receipt' else a)['native_session_id']
+        check(poll(f, r, a)['fake_eligible_jobs'] == 0, 'missing native binding is not wildcard')
+    f, r, a, _ = fixture(); poll(f, r, a)
+    r2 = dict(r, native_session_id='SUCCESSOR_NATIVE'); a2 = dict(a, native_session_id='SUCCESSOR_NATIVE')
+    check(poll(f, r2, a2)['fake_eligible_jobs'] == 0,
+          'matching rewritten receipt/auth cannot rebind old final into new native session')
+    decision = json.loads(query(f, 'SELECT latest_decision_json FROM admission_audit')[0][0])
+    check(decision['reason'] == 'JOB_NATIVE_SESSION_SNAPSHOT_MISMATCH', 'explicit native snapshot guard')
+
+
+@case('job_generation_is_persisted_and_cannot_be_refreshed_after_speech_onset')
+def _():
+    f, r, a, _ = fixture(); check(poll(f, r, a)['fake_eligible_jobs'] == 1, 'initial generation accepted')
+    check(query(f, 'SELECT native_session_snapshot,job_generation_snapshot FROM admission_audit')[0]
+          == ('FAKE_NATIVE_SESSION', 0), 'native and job generation stored in transaction')
+    advanced = dict(a, job_generation=1)
+    check(poll(f, r, advanced)['fake_eligible_jobs'] == 0, 'new boundary generation cannot reauthorize old final')
+    decision = json.loads(query(f, 'SELECT latest_decision_json FROM admission_audit')[0][0])
+    check(decision['reason'] == 'JOB_PLAYBACK_GENERATION_SNAPSHOT_MISMATCH', 'job generation rejection explicit')
+    check(query(f, 'SELECT job_generation_snapshot FROM admission_audit')[0][0] == 0,
+          'first job generation remains immutable')
+    f, r, a, _ = fixture(); del a['job_generation']
+    check(poll(f, r, a)['fake_eligible_jobs'] == 0, 'absence of job generation is not wildcard')
+
+
+@case('playback_packet_has_exact_join_and_is_provenance_only_not_audio_permission')
+def _():
+    f, r, a, final = fixture(); poll(f, r, a)
+    packet = read_playback_evidence(f / 'source.sqlite', 'FAKE_THREAD', f / 'journal.sqlite',
+                                   ('FAKE_THREAD', 'FAKE_TURN', 'FAKE_FINAL'),
+                                   admission_receipts=[r], authorization=a)
+    check(packet['identity'] == {
+        'thread_id': 'FAKE_THREAD', 'native_session_id': 'FAKE_NATIVE_SESSION',
+        'voice_session_generation': 1, 'origin_id': r['origin_id'], 'client_id': r['client_id'],
+        'queued_item_id': r['queued_item_id'], 'turn_id': 'FAKE_TURN',
+        'final_agent_item_id': 'FAKE_FINAL', 'first_user_item_id': 'FAKE_USER', 'job_generation': 0,
+    }, 'packet binds each required identity')
+    check(packet['provenance_only'] and not packet['egress_authorized'], 'packet is never permission to play')
+    check(packet['journal']['job_generation'] == 0 and packet['journal']['status'] == 'ELIGIBLE_FAKE_ONLY',
+          'packet carries immutable journal rather than caller refreshed generation')
+    check(packet['source']['first_user']['client_id'] == r['client_id'], 'first user proof included')
+    check(packet['source']['final_item']['text'] == final['text'], 'text retained without heuristic stripping')
+    check(packet['receipt_sha256'] == sha(canonical(r)) and packet['authorization_sha256'] == sha(canonical(a)),
+          'snapshot canonical hashes match exact packets')
+    r['native_session_id'] = 'MUTATED_AFTER_PACKET'; a['job_generation'] = 1
+    check(packet['admission_receipt']['native_session_id'] == 'FAKE_NATIVE_SESSION'
+          and packet['authorization']['job_generation'] == 0, 'packet detached from later caller mutation')
+    write_receipt(RUN / 'PLAYBACK-EVIDENCE-FAKE.json', packet)
+
+
+@case('playback_reader_refuses_new_generation_source_conflicts_and_unpolled_final')
+def _():
+    f, r, a, final = fixture(); poll(f, r, a)
+    def read(auth):
+        return read_playback_evidence(f / 'source.sqlite', 'FAKE_THREAD', f / 'journal.sqlite',
+                                     ('FAKE_THREAD', 'FAKE_TURN', 'FAKE_FINAL'),
+                                     admission_receipts=[r], authorization=auth)
+    for changed_auth in (dict(a, job_generation=1), dict(a, native_session_id='OTHER_NATIVE'),
+                         dict(a, state='Revoked')):
+        try: read(changed_auth)
+        except ValueError: check(True, 'current read refuses invalid authorization even before next poll')
+        else: check(False, 'invalid current authorization passed packet builder')
+    changed = dict(final, text='FAKE CHANGED AFTER LAST POLL')
+    modify(f, "UPDATE thread_items SET item_json=? WHERE item_id='FAKE_FINAL'", (canonical(changed),))
+    try: read(a)
+    except ValueError: check(True, 'current source changed after poll invalidates packet')
+    else: check(False, 'stale journal falsely authorized changed source')
+    poll(f, r, a)
+    modify(f, "UPDATE thread_items SET item_json=? WHERE item_id='FAKE_FINAL'", (canonical(final),))
+    try: read(a)
+    except ValueError: check(True, 'restored text does not erase journal HOLD_SOURCE_CONFLICT')
+    else: check(False, 'original text restoration bypassed persistent conflict')
+
+
+
+@case('missing_optional_questions_still_builds_packet_without_relaxing_delivery')
+def _():
+    f, r, a, final = fixture()
+    final.pop('questions')
+    modify(f, "UPDATE thread_items SET item_json=? WHERE item_id='FAKE_FINAL'", (canonical(final),))
+    check(poll(f, r, a)['fake_eligible_jobs'] == 1, 'schema permits absent optional questions')
+    packet = read_playback_evidence(f / 'source.sqlite', 'FAKE_THREAD', f / 'journal.sqlite',
+                                   ('FAKE_THREAD', 'FAKE_TURN', 'FAKE_FINAL'),
+                                   admission_receipts=[r], authorization=a)
+    check(packet['source']['final_item']['questions'] is None, 'absence explicitly projected as nullable questions')
+    check(packet['source']['final_item']['delivery'] is None, 'mandatory delivery remains present')
+    f2, r2, a2, final2 = fixture(); final2.pop('delivery')
+    modify(f2, "UPDATE thread_items SET item_json=? WHERE item_id='FAKE_FINAL'", (canonical(final2),))
+    check(poll(f2, r2, a2)['fake_eligible_jobs'] == 0, 'missing mandatory delivery still holds')
 
 
 def main():

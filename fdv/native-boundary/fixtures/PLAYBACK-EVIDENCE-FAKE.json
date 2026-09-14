@@ -1,0 +1,80 @@
+{
+  "schema": "fdv.voice.playback.evidence.v1",
+  "identity": {
+    "thread_id": "FAKE_THREAD",
+    "native_session_id": "FAKE_NATIVE_SESSION",
+    "voice_session_generation": 1,
+    "origin_id": "opaque_origin_without_generation_syntax",
+    "client_id": "opaque_origin_without_generation_syntax",
+    "queued_item_id": "FAKE_QUEUE",
+    "turn_id": "FAKE_TURN",
+    "final_agent_item_id": "FAKE_FINAL",
+    "first_user_item_id": "FAKE_USER",
+    "job_generation": 0
+  },
+  "source": {
+    "classification": "BACKEND_FINAL_PROVENANCE_NC",
+    "turn_status": "completed",
+    "final_pointer": "FAKE_FINAL",
+    "final_item_id": "FAKE_FINAL",
+    "final_item": {
+      "id": "FAKE_FINAL",
+      "type": "agentMessage",
+      "text": "FAKE final text.\n",
+      "phase": "final_answer",
+      "delivery": null,
+      "questions": []
+    },
+    "first_user_item_id": "FAKE_USER",
+    "first_user": {
+      "id": "FAKE_USER",
+      "type": "userMessage",
+      "client_id": "opaque_origin_without_generation_syntax",
+      "valid": true
+    },
+    "version_sha256": "9fcb80d85652fa48d416e00b9561803d5068d48e3d6bbb3a2836d995c873e51e",
+    "text_sha256": "b8ca3fef13bda78e4f378fdc93522ef66c535bab88c35a7de135a34bcb3402c7"
+  },
+  "journal": {
+    "status": "ELIGIBLE_FAKE_ONLY",
+    "original_version_sha256": "9fcb80d85652fa48d416e00b9561803d5068d48e3d6bbb3a2836d995c873e51e",
+    "text_sha256": "b8ca3fef13bda78e4f378fdc93522ef66c535bab88c35a7de135a34bcb3402c7",
+    "native_session_id": "FAKE_NATIVE_SESSION",
+    "voice_session_generation": 1,
+    "job_generation": 0,
+    "original_receipt_sha256": "94075281a1b78f1dc98dae161bb323f41dc6497088c05f9f7c9acd1f523d0155"
+  },
+  "admission_receipt": {
+    "schema": "fdv.voice.admission.v1",
+    "receipt_id": "FAKE_QUEUE",
+    "thread_id": "FAKE_THREAD",
+    "native_session_id": "FAKE_NATIVE_SESSION",
+    "voice_session_generation": 1,
+    "origin_id": "opaque_origin_without_generation_syntax",
+    "handoff_id": null,
+    "item_id": null,
+    "client_id": "opaque_origin_without_generation_syntax",
+    "queued_item_id": "FAKE_QUEUE",
+    "turn_id": "FAKE_TURN",
+    "admission_result": "Started",
+    "attempt_id": "FAKE_ATTEMPT",
+    "input_digest": null
+  },
+  "authorization": {
+    "schema": "fdv.voice.authorization.v1",
+    "state": "Active",
+    "job_generation": 0,
+    "thread_id": "FAKE_THREAD",
+    "native_session_id": "FAKE_NATIVE_SESSION",
+    "voice_session_generation": 1,
+    "origin_id": "opaque_origin_without_generation_syntax",
+    "client_id": "opaque_origin_without_generation_syntax",
+    "queued_item_id": "FAKE_QUEUE",
+    "input_digest": null
+  },
+  "receipt_sha256": "94075281a1b78f1dc98dae161bb323f41dc6497088c05f9f7c9acd1f523d0155",
+  "authorization_sha256": "8dedccbb0311e87153552baec8f437ca09c4e4a9d3b872511a04ecbafa4d9bb2",
+  "provenance_only": true,
+  "egress_authorized": false,
+  "source_payload_digest_verified": false
+}

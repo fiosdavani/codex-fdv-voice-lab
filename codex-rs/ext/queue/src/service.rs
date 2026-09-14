@@ -337,6 +337,7 @@ impl QueuedItemService {
     pub async fn reconcile_voice_started(
         &self,
         thread_id: ThreadId,
+        native_session_id: String,
         origin_id: String,
         client_id: String,
         turn_id: String,
@@ -344,7 +345,7 @@ impl QueuedItemService {
         let receipt = {
             let _guard = self.dispatch_guard(thread_id).await;
             let receipt = self.queue.reconcile_voice_started(
-                thread_id, origin_id, client_id, turn_id,
+                thread_id, native_session_id, origin_id, client_id, turn_id,
             ).await?;
             self.emit_changed(thread_id);
             receipt

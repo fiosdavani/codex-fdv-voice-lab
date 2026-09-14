@@ -17,9 +17,9 @@ import stat
 import uuid
 
 if __package__:
-    from .admission_gate import evaluate_final_admission, frozen_turns, is_frozen
+    from .admission_gate import build_playback_evidence, evaluate_final_admission, frozen_turns, is_frozen
 else:
-    from admission_gate import evaluate_final_admission, frozen_turns, is_frozen
+    from admission_gate import build_playback_evidence, evaluate_final_admission, frozen_turns, is_frozen
 
 ROOT = Path(__file__).resolve().parent
 SQL = '''SELECT t.thread_id,t.turn_id,t.final_agent_item_id,
@@ -57,6 +57,7 @@ CREATE TABLE jobs(
 CREATE TABLE admission_audit(
  thread_id TEXT NOT NULL,turn_id TEXT NOT NULL,item_id TEXT NOT NULL,
  generation_snapshot INTEGER,original_receipt_sha256 TEXT,
+ native_session_snapshot TEXT,job_generation_snapshot INTEGER,
  latest_decision_json TEXT NOT NULL,last_poll TEXT NOT NULL,
  PRIMARY KEY(thread_id,turn_id,item_id));
 '''
@@ -188,7 +189,7 @@ def read_snapshot(source_path, thread_id):
 
 
 def expected_binding(source_path, thread_id, schema_hash):
-    return {'schema': 'fdv.candidate.final.capture.journal.v2',
+    return {'schema': 'fdv.candidate.final.capture.journal.v3',
             'source_path': str(Path(source_path).resolve(strict=True)),
             'thread_id': thread_id, 'source_schema_sha256': schema_hash,
             'egress': 'DISABLED_REAL_EGRESS_ELIGIBILITY_IS_FAKE_ONLY'}
@@ -296,12 +297,14 @@ def poll_once(source_path, thread_id, journal_path, _test_hook=None,
                       (run_id, *key, r['version_sha256']))
             existing = c.execute('''SELECT original_version_sha256,status FROM jobs
                  WHERE thread_id=? AND turn_id=? AND item_id=?''', key).fetchone()
-            prior = c.execute('''SELECT generation_snapshot,original_receipt_sha256
-              FROM admission_audit WHERE thread_id=? AND turn_id=? AND item_id=?''', key).fetchone()
+            prior = c.execute('''SELECT generation_snapshot,original_receipt_sha256,
+              native_session_snapshot,job_generation_snapshot FROM admission_audit WHERE thread_id=? AND turn_id=? AND item_id=?''', key).fetchone()
             scoped_record = dict(r)
             if prior is not None:
                 scoped_record['job_voice_session_generation'] = prior[0]
                 scoped_record['job_receipt_sha256'] = prior[1]
+                scoped_record['job_native_session_id'] = prior[2]
+                scoped_record['job_generation'] = prior[3]
             decision = evaluate_final_admission(scoped_record, admission_receipts, authorization)
             status = decision['status']
             if existing is not None:
@@ -327,16 +330,22 @@ def poll_once(source_path, thread_id, journal_path, _test_hook=None,
                                     reason='SOURCE_HISTORY_OR_CONFLICT_OVERRIDES_RECEIPT')
                 generation = prior[0] if prior else None
                 receipt_sha = prior[1] if prior else None
+                native_session = prior[2] if prior else None
+                job_generation = prior[3] if prior else None
                 if decision['eligible_fake_only'] and generation is None:
                     generation = decision['voice_session_generation']
                     receipt_sha = decision['receipt_sha256']
-                c.execute('''INSERT INTO admission_audit VALUES(?,?,?,?,?,?,?)
+                    native_session = decision['native_session_id']
+                    job_generation = decision['job_generation']
+                c.execute('''INSERT INTO admission_audit VALUES(?,?,?,?,?,?,?,?,?)
                   ON CONFLICT(thread_id,turn_id,item_id) DO UPDATE SET
                   latest_decision_json=excluded.latest_decision_json,
                   last_poll=excluded.last_poll,
                   generation_snapshot=COALESCE(admission_audit.generation_snapshot,excluded.generation_snapshot),
-                  original_receipt_sha256=COALESCE(admission_audit.original_receipt_sha256,excluded.original_receipt_sha256)''',
-                          (*key, generation, receipt_sha, canonical(decision), run_id))
+                  original_receipt_sha256=COALESCE(admission_audit.original_receipt_sha256,excluded.original_receipt_sha256),
+                  native_session_snapshot=COALESCE(admission_audit.native_session_snapshot,excluded.native_session_snapshot),
+                  job_generation_snapshot=COALESCE(admission_audit.job_generation_snapshot,excluded.job_generation_snapshot)''',
+                          (*key, generation, receipt_sha, native_session, job_generation, canonical(decision), run_id))
         for key in c.execute('SELECT thread_id,turn_id,item_id FROM jobs').fetchall():
             if tuple(key) not in seen:
                 c.execute('''UPDATE jobs SET status='HOLD_SOURCE_UNAVAILABLE'
@@ -384,6 +393,46 @@ def poll_once(source_path, thread_id, journal_path, _test_hook=None,
             'tail_source_exclusion_from_inventory': 'NC_NO_STRUCTURAL_PROVENANCE',
             'tail_egress': 'DISABLED_WITH_ALL_OTHER_UNPROVEN_JOBS',
             'windows_assertions': 0}
+
+
+
+def read_playback_evidence(source_path, thread_id, journal_path, identity,
+                           *, admission_receipts, authorization):
+    """Read current source + owned candidate journal, return provenance only.
+
+    Does not mutate the journal, repair missing rows, refresh a job generation,
+    or emit audio. A later live combined gate is mandatory before future TTS.
+    """
+    identity = tuple(identity)
+    if len(identity) != 3 or identity[0] != thread_id:
+        raise ValueError('PLAYBACK_IDENTITY_THREAD_MISMATCH')
+    snapshot = read_snapshot(source_path, thread_id)
+    matches = [r for r in snapshot['records'] if r['identity'] == identity]
+    if len(matches) != 1:
+        raise ValueError('PLAYBACK_CURRENT_SOURCE_NOT_UNIQUE')
+    binding = expected_binding(source_path, thread_id, snapshot['schema_sha256'])
+    journal_path = local_output(journal_path)
+    verify_ownership_proof(journal_path, binding)
+    if journal_metadata(journal_path, read_only=True) != binding:
+        raise ValueError('PLAYBACK_JOURNAL_BINDING_MISMATCH')
+    c = connect_source(journal_path)
+    try:
+        c.execute('BEGIN')
+        job = c.execute("""SELECT status,original_version_sha256,text_sha256 FROM jobs
+          WHERE thread_id=? AND turn_id=? AND item_id=?""", identity).fetchone()
+        audit = c.execute("""SELECT generation_snapshot,original_receipt_sha256,
+          native_session_snapshot,job_generation_snapshot FROM admission_audit
+          WHERE thread_id=? AND turn_id=? AND item_id=?""", identity).fetchone()
+        c.rollback()
+    finally:
+        c.close()
+    if job is None or audit is None:
+        raise ValueError('PLAYBACK_IMMUTABLE_JOB_PROOF_ABSENT')
+    record = dict(matches[0], journal_status=job[0],
+                  journal_original_version_sha256=job[1], journal_text_sha256=job[2],
+                  job_voice_session_generation=audit[0], job_receipt_sha256=audit[1],
+                  job_native_session_id=audit[2], job_generation=audit[3])
+    return build_playback_evidence(record, admission_receipts, authorization)
 
 
 def write_receipt(path, result):

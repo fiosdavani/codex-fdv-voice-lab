@@ -1,12 +1,13 @@
 # Producer admission gate — offline candidate
 
 This directory evolves a COPY of the previously reviewed producer. The original
-package and its real 93-job journal are unchanged. `final_producer_base.py` is the
+package and its real 93-job journal are unchanged. This delta does not reopen
+either source; the exact historical freeze SHA remains unchanged. `final_producer_base.py` is the
 preserved starting source; it is not the active gate implementation.
 
 ## Result and scope
 
-- Admission suite: **PASS, 199 assertions / 14 scenarios**.
+- Admission suite: **PASS, 239 assertions / 19 scenarios**.
 - Existing SQLite regression: **PASS, 70 assertions / 14 scenarios**, including
   four real benign Linux subprocesses and cache-spill rollback recovery.
 - Windows, real Voice, TTS, audio, network and Codex RPC executions: **zero**.
@@ -45,6 +46,7 @@ authenticate a real origin, owner or live session.
   "schema": "fdv.voice.admission.v1",
   "receipt_id": "opaque-queue-id",
   "thread_id": "thread-id",
+  "native_session_id": "native-session-id",
   "voice_session_generation": 1,
   "origin_id": "opaque-origin-id",
   "handoff_id": null,
@@ -76,7 +78,9 @@ user item never authorizes a replay or requeue.
 {
   "schema": "fdv.voice.authorization.v1",
   "state": "Active",
+  "job_generation": 0,
   "thread_id": "thread-id",
+  "native_session_id": "native-session-id",
   "voice_session_generation": 1,
   "origin_id": "opaque-origin-id",
   "client_id": "opaque-origin-id",
@@ -86,8 +90,10 @@ user item never authorizes a replay or requeue.
 ```
 
 This is a per-job snapshot of the caller's CURRENT session authorization.
-Generation must be an integer at least one; booleans and stringified numbers
-are rejected. Thread, generation, origin, client, queue ID and input digest must
+Voice generation must be a JavaScript-safe integer at least one; job generation
+must be a JavaScript-safe integer at least zero. Booleans/stringified numbers
+are rejected. Native session ID is required; absence is not a wildcard. Thread,
+native session, voice generation, origin, client, queue ID and input digest must
 match the receipt exactly. Inactive or absent authorization causes HOLD even
 after a previous eligible poll.
 
@@ -113,12 +119,60 @@ duplicate JSON keys, absent/null/invalid IDs and mismatched pointers HOLD. The
 measured real projection uses `clientId`; the observation is documented separately.
 The presence of a client ID alone never establishes a Voice origin.
 
-`admission_audit` persists the first positive generation and receipt hash in the
-same candidate journal transaction as the job decision. A later authorization
-generation cannot rebind that old job; a changed committed receipt cannot
+`admission_audit` persists the first positive native session, voice generation,
+job generation and receipt hash in the same candidate journal transaction as
+the job decision. A later authorization
+voice generation cannot rebind that old job. A matching receipt/authorization
+rewritten for another native session is also held. Advancing authorization
+job_generation after speech onset cannot refresh an old final; a changed committed receipt cannot
 silently replace its first proof. Current authorization is checked on every poll.
 Revocation concurrent with a later renderer operation still requires the
 renderer/consumer's own immediate authorization recheck.
+
+## Combined-gate evidence, never isolated producer authorization
+
+```python
+read_playback_evidence(source_path, thread_id, journal_path,
+                      (thread_id, turn_id, final_agent_item_id),
+                      admission_receipts=[receipt], authorization=authorization)
+```
+
+This additional entry point is read-only. It requires an already committed,
+owned v3 candidate journal job and its immutable first-generation audit. It
+rereads current source rows; source disappearance/change or a persistent journal
+HOLD cannot be bypassed by supplying a plausible receipt. It does not create a
+job, update eligibility or repair a journal. `build_playback_evidence` is the pure
+validator used after that reader enriches a record; arbitrary caller dictionaries
+remain trusted-input contracts, not authenticated evidence.
+
+Returned schema `fdv.voice.playback.evidence.v1` contains:
+
+- `identity`: thread/native session/voice generation/origin/client/queue/turn/
+  final item/first user item/job generation.
+- `source`: final pointer and final item, exact first user evidence, source
+  version hash and text hash. The final text remains intact for future TTS.
+- `journal`: eligible fake status, original source version and text hash,
+  immutable native/voice/job generations and original receipt hash.
+- Full matched `admission_receipt` and `authorization` snapshots, their exact
+  canonical SHA256s, `provenance_only=true`, `egress_authorized=false`.
+
+Canonical hashing uses UTF-8 `json.dumps(ensure_ascii=False, sort_keys=True,
+separators=(',', ':'))`. Packets must remain private when they contain real final
+text. The packaged fixture contains exclusively synthetic text. A detached JSON
+copy prevents later caller mutation from changing a captured packet; it does
+not turn the packet into current authority.
+
+The root-owned `authorizeVaiPlayback` must call a trusted evidence reader at the
+play boundary, revalidate all packet identities/hashes, and combine them with
+actual current native session, owner, generation and mute fences. The real
+authorization producer must retain the job generation assigned to each origin;
+it cannot stamp the newest boundary generation onto an old final that arrives
+after an onset. Freezing generation at first eligibility alone does not prove
+that upstream origin-to-generation assignment. That live assignment is **NC**. Neither a
+producer packet nor a boundary-only success authorizes playback. The trusted
+live authorization source, native adapter and cross-process transport remain
+**NC**, not proved by these offline tests. These APIs do not promise atomicity
+across SQLite, JavaScript and a future player. No TTS/audio is invoked here.
 
 ## Historical freeze and source changes
 
@@ -137,8 +191,9 @@ Source disappearance removes eligibility from both jobs and the audit record.
 The final text, including literal `[COMPLETE]`, is never stripped or normalized.
 This is not proof of semantic envelope interpretation.
 
-The candidate journal schema is v2. It does not migrate the original private v1
-journal. The previous journal recovery guards remain candidate-file-only and
+The delta candidate journal schema is v3. It does not migrate the original
+private v1 journal or the previous candidate v2 journal. Old journals fail the
+binding check rather than silently gaining playback authorization. The previous journal recovery guards remain candidate-file-only and
 cooperative under the same UID; they are not protection against a malicious
 same-UID writer, general power-failure recovery or a production authority layer.
 

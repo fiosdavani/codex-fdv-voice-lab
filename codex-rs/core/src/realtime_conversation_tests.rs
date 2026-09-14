@@ -209,7 +209,8 @@ async fn clears_active_handoff_explicitly() {
     let (tx, _rx) = bounded(1);
     let state = RealtimeHandoffState {
         output_tx: tx,
-        last_output: Arc::new(Mutex::new(None)),
+        last_output: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        voice_routes: None,
         stream: Arc::new(Mutex::new(Default::default())),
         client_managed_handoffs: false,
         codex_responses_as_items: false,
@@ -233,6 +234,7 @@ async fn clears_active_handoff_explicitly() {
 #[test]
 fn streamed_handoff_preserves_a_bounded_final_tail() {
     let mut item = RealtimeStreamedItem {
+        turn_id: "test-turn".to_string(),
         handoff_id: "handoff_1".to_string(),
         phase: Some(MessagePhase::FinalAnswer),
         bem_channel_parser: None,
@@ -263,6 +265,7 @@ fn streamed_handoff_preserves_a_bounded_final_tail() {
 #[test]
 fn streamed_v3_handoff_omits_the_final_message_prefix() {
     let mut item = RealtimeStreamedItem {
+        turn_id: "test-turn".to_string(),
         handoff_id: "handoff_1".to_string(),
         phase: Some(MessagePhase::FinalAnswer),
         bem_channel_parser: None,

@@ -26,7 +26,7 @@ THREAD = '00000000-0000-7000-8000-000000000001'
 def digest(path): return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 def encode(value): return json.dumps(value, sort_keys=True, separators=(',', ':'))
 def origin(key='origin-A'):
-    return dict(voice_session_generation=1, origin_id=key, handoff_id='handoff-'+key, item_id='item-'+key)
+    return dict(native_session_id='native-session-A', voice_session_generation=1, origin_id=key, handoff_id='handoff-'+key, item_id='item-'+key)
 def payload(o, text='same legitimate words'):
     return encode({'UserInput': {'client_id': o['origin_id'], 'content': [{'type':'text','text':text,'text_elements':[]}]}})
 
@@ -49,9 +49,9 @@ class Queue:
         p=payload(o,text); q=str(uuid.uuid4())
         self.c.execute('BEGIN IMMEDIATE')
         try:
-            inserted=self.c.execute(SQL['ENQUEUE_VOICE_RECEIPT_SQL'],(THREAD,o['origin_id'],o['voice_session_generation'],o['handoff_id'],o['item_id'],q,o['origin_id'],p)).rowcount
+            inserted=self.c.execute(SQL['ENQUEUE_VOICE_RECEIPT_SQL'],(THREAD,o['origin_id'],o['native_session_id'],o['voice_session_generation'],o['handoff_id'],o['item_id'],q,o['origin_id'],p)).rowcount
             row=self.get(o)
-            if any(row[k]!=o[k] for k in ('origin_id','voice_session_generation','handoff_id','item_id')) or row['payload_json']!=p:
+            if any(row[k]!=o[k] for k in ('origin_id','native_session_id','voice_session_generation','handoff_id','item_id')) or row['payload_json']!=p:
                 raise ValueError('ORIGIN_CONFLICT')
             if inserted:
                 n=self.c.execute(SQL['ENQUEUE_VOICE_ITEM_SQL'],(q,THREAD,p,THREAD,1,1,THREAD,100)).rowcount
@@ -84,7 +84,7 @@ class Queue:
         turn=turns[0]
         self.c.execute('BEGIN IMMEDIATE')
         try:
-            row=self.c.execute(SQL['RECONCILE_VOICE_STARTED_SQL'],(turn,THREAD,o['origin_id'],o['origin_id'],turn)).fetchone()
+            row=self.c.execute(SQL['RECONCILE_VOICE_STARTED_SQL'],(turn,THREAD,o['native_session_id'],o['origin_id'],o['origin_id'],turn)).fetchone()
             if row is None: raise ValueError('RECONCILE_REJECTED')
             self.c.execute(SQL['REMOVE_VOICE_ITEM_SQL'],(THREAD,row['queued_item_id']))
             self.c.commit(); return dict(row)
@@ -162,6 +162,49 @@ def run():
     except ValueError:check(True)
     q.close();c.close();done('duplicate_origin_one_durable_admission_and_one_fake_started',before)
 
+    before=checks;q,c=bench('native_session_identity')
+    a=origin();original=q.enqueue(a);wrong=a|{'native_session_id':'native-session-B'}
+    check(q.public_receipt(a)['native_session_id']=='native-session-A')
+    try:q.enqueue(wrong);check(False)
+    except ValueError as e:check(str(e)=='ORIGIN_CONFLICT')
+    check(q.get(a)==original)
+    for invalid in (None,'','   '):
+        try:q.enqueue(a|{'origin_id':'invalid-session-'+repr(invalid),'native_session_id':invalid});check(False)
+        except sqlite3.IntegrityError:check(True)
+    try:q.c.execute('UPDATE voice_admission_receipts SET native_session_id=? WHERE origin_id=?',('native-session-B',a['origin_id']));check(False)
+    except sqlite3.IntegrityError:check(True)
+    claim=q.claim(a);turn=c.start_if_idle(claim)
+    try:q.reconcile(wrong,c);check(False)
+    except ValueError as e:check(str(e)=='RECONCILE_REJECTED')
+    check(q.get(a)['admission_result']=='Claimed')
+    reconciled=q.reconcile(a,c)
+    check(reconciled['turn_id']==turn and reconciled['native_session_id']==a['native_session_id'])
+    check(c.count()==1)
+    q.close();c.close();done('same_thread_generation_wrong_native_session_denied',before)
+
+    before=checks;d=base/'legacy_null_session';d.mkdir()
+    legacy=sqlite3.connect(d/'queue.sqlite',isolation_level=None)
+    migration_paths=sorted((REPO/'codex-rs/state/queue_migrations').glob('*.sql'))
+    for path in migration_paths:
+        if not path.name.startswith('0004_'):legacy.executescript(path.read_text())
+    old_origin=origin('old-unbound');old_payload=payload(old_origin)
+    legacy.execute("INSERT INTO voice_admission_receipts(thread_id,origin_id,voice_session_generation,queued_item_id,client_id,payload_json,admission_result) VALUES(?,?,1,?,?,?,'Queued')",(THREAD,old_origin['origin_id'],'old-queue',old_origin['origin_id'],old_payload))
+    legacy.execute(SQL['ENQUEUE_VOICE_ITEM_SQL'],('old-queue',THREAD,old_payload,THREAD,1,1,THREAD,100))
+    # This is a real old schema -> additive candidate migration, not NULL forged
+    # after validation. Preserve row identity/result and require fail-closed.
+    legacy.executescript((REPO/'codex-rs/state/queue_migrations/0004_voice_native_session.sql').read_text())
+    legacy.close();q=Queue(d);c=FakeCore(d)
+    check(q.get(old_origin)['native_session_id'] is None)
+    check(q.claim(old_origin) is None)
+    check(q.dispatch(old_origin,c)=='BLOCKED_OR_ALREADY_ADMITTED');check(c.count()==0)
+    try:q.enqueue(old_origin);check(False)
+    except ValueError as e:check(str(e)=='ORIGIN_CONFLICT')
+    try:q.c.execute('UPDATE voice_admission_receipts SET native_session_id=? WHERE origin_id=?',('native-session-A',old_origin['origin_id']));check(False)
+    except sqlite3.IntegrityError:check(True)
+    check(q.get(old_origin)['admission_result']=='Queued')
+    check(q.c.execute('SELECT count(*) FROM queued_items').fetchone()[0]==1)
+    q.close();c.close();done('pre_session_receipt_stays_unbound_and_cannot_replay',before)
+
     before=checks;q,c=bench('busy')
     a=origin('A');b=origin('B');q.enqueue(a);q.enqueue(b)
     t1=q.dispatch(a,c);check(q.dispatch(b,c)=='BUSY_QUEUED');check(c.count()==1)
@@ -208,11 +251,11 @@ def run():
     # The integrated sample is generated through the same SQL and FAKE Core,
     # then consumed by the evolved real producer. No hand-built Started receipt.
     before=checks;q,c=bench('e2e');o=origin('E2E_ORIGIN');q.enqueue(o);turn=q.dispatch(o,c);final=c.complete(turn)
-    receipt=q.public_receipt(o);check(receipt['client_id']==o['origin_id'])
+    receipt=q.public_receipt(o);check(receipt['client_id']==o['origin_id']);check(receipt['native_session_id']==o['native_session_id'])
     check(c.turns_for_client(o['origin_id'])==[turn])
     (base/'E2E-ADMISSION.json').write_text(json.dumps({'scope':'FAKE_CORE_REAL_CANDIDATE_SQL','receipt':receipt,'source_path':str(c.path),'final_agent_item_id':final},indent=2)+'\n')
     q.close();c.close();done('client_id_preserved_into_fake_user_item_and_receipt',before)
-    result={'schema':'fdv.queue.sql.tests.v1','result':'PASS','assertions':checks,'scenarios':len(cases),'cases':cases,'real_subprocesses':processes,'sqlite_version':sqlite3.sqlite_version,'sql_extracted_from_rust':True,'rust_execution':False,'core':'FAKE_EXPLICIT','voice_windows_network_audio':False,'source_hashes':{'queued_voice.rs':digest(RUST),'harness':digest(__file__)},'e2e_admission_path':str(base/'E2E-ADMISSION.json')}
+    result={'schema':'fdv.queue.sql.tests.v1','result':'PASS','assertions':checks,'scenarios':len(cases),'cases':cases,'real_subprocesses':processes,'sqlite_version':sqlite3.sqlite_version,'sql_extracted_from_rust':True,'rust_execution':False,'core':'FAKE_EXPLICIT','voice_windows_network_audio':False,'source_hashes':{'queued_voice.rs':digest(RUST),'harness':digest(__file__),'migration0003':digest(REPO/'codex-rs/state/queue_migrations/0003_queued_submission_receipts.sql'),'migration0004':digest(REPO/'codex-rs/state/queue_migrations/0004_voice_native_session.sql')},'e2e_admission_path':str(base/'E2E-ADMISSION.json')}
     (base/'RECEIPT.json').write_text(json.dumps(result,indent=2)+'\n')
     print(json.dumps({'receipt':str(base/'RECEIPT.json'),**{k:v for k,v in result.items() if k not in ('cases','source_hashes')}},indent=2))
 

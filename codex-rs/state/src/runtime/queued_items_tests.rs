@@ -9,6 +9,7 @@ use std::borrow::Cow;
 
 fn voice_origin(id: &str) -> crate::VoiceQueueOrigin {
     crate::VoiceQueueOrigin {
+        native_session_id: "native-session-A".to_string(),
         voice_session_generation: 1,
         origin_id: id.to_string(),
         handoff_id: Some("handoff".to_string()),
@@ -43,6 +44,13 @@ async fn voice_origin_replay_cannot_replace_input_or_recreate_a_started_item() {
         queue.enqueue_voice(thread_id, &payload, &origin).await.unwrap(),
     );
     assert!(queue.enqueue_voice(thread_id, &voice_payload(&origin, "changed"), &origin).await.is_err());
+    assert_eq!(origin.native_session_id, receipt.native_session_id);
+    let mut wrong_session = origin.clone();
+    wrong_session.native_session_id = "native-session-B".to_string();
+    assert!(queue.enqueue_voice(thread_id, &payload, &wrong_session).await.is_err());
+    let mut blank_session = origin.clone();
+    blank_session.native_session_id = " ".to_string();
+    assert!(queue.enqueue_voice(thread_id, &payload, &blank_session).await.is_err());
     assert_eq!(Some(receipt.clone()), queue.get_voice_receipt(thread_id, &origin.origin_id).await.unwrap());
     queue.claim_voice(thread_id, &receipt.queued_item_id, "attempt-1").await.unwrap().unwrap();
     let started = queue.finish_voice_claim(thread_id, &receipt.queued_item_id, "attempt-1",
@@ -93,14 +101,15 @@ async fn voice_claim_survives_restart_and_only_positive_reconciliation_dequeues(
     expected.reason = Some("lost receipt".to_string());
     assert_eq!(expected, ambiguous);
     assert_eq!(None, queue.claim_voice(thread_id, &receipt.queued_item_id, "retry").await.unwrap());
-    assert!(queue.reconcile_voice_started(thread_id, &origin.origin_id, "wrong-client", "turn").await.is_err());
-    let started = queue.reconcile_voice_started(thread_id, &origin.origin_id, &origin.origin_id, "turn").await.unwrap();
+    assert!(queue.reconcile_voice_started(thread_id, &origin.native_session_id, &origin.origin_id, "wrong-client", "turn").await.is_err());
+    assert!(queue.reconcile_voice_started(thread_id, "native-session-B", &origin.origin_id, &origin.origin_id, "turn").await.is_err());
+    let started = queue.reconcile_voice_started(thread_id, &origin.native_session_id, &origin.origin_id, &origin.origin_id, "turn").await.unwrap();
     expected.admission_result = VoiceAdmissionResult::Started;
     expected.reason = None;
     expected.turn_id = Some("turn".to_string());
     assert_eq!(expected, started);
-    assert_eq!(started, queue.reconcile_voice_started(thread_id, &origin.origin_id, &origin.origin_id, "turn").await.unwrap());
-    assert!(queue.reconcile_voice_started(thread_id, &origin.origin_id, &origin.origin_id, "different-turn").await.is_err());
+    assert_eq!(started, queue.reconcile_voice_started(thread_id, &origin.native_session_id, &origin.origin_id, &origin.origin_id, "turn").await.unwrap());
+    assert!(queue.reconcile_voice_started(thread_id, &origin.native_session_id, &origin.origin_id, &origin.origin_id, "different-turn").await.is_err());
     assert!(queue.list_page(thread_id, /*offset*/ 0, /*limit*/ 1).await.unwrap().is_empty());
 }
 
@@ -137,6 +146,50 @@ async fn voice_busy_release_is_attempt_scoped_and_cancellation_keeps_tombstone()
     assert_eq!(VoiceEnqueueOutcome::Existing(expected),
         queue.enqueue_voice(thread_id, &payload, &origin).await.unwrap());
     assert!(queue.list_page(thread_id, /*offset*/ 0, /*limit*/ 1).await.unwrap().is_empty());
+}
+
+
+#[tokio::test]
+async fn migrating_receipts_cannot_invent_a_native_session() {
+    let home = unique_temp_dir();
+    tokio::fs::create_dir_all(&home).await.unwrap();
+    let sqlite = crate::SqliteConfig::new_for_testing(home.as_path().abs());
+    let old_queue_migrator = Migrator {
+        migrations: Cow::Owned(QUEUE_MIGRATOR.migrations.iter().take(3).cloned().collect()),
+        ignore_missing: false,
+        locking: true,
+        no_tx: false,
+        table_name: QUEUE_MIGRATOR.table_name.clone(),
+        create_schemas: QUEUE_MIGRATOR.create_schemas.clone(),
+    };
+    let pool = sqlite.open_read_write_pool(&sqlite.queue_db_path()).await.unwrap();
+    old_queue_migrator.run(&pool).await.unwrap();
+    let thread_id = ThreadId::new();
+    sqlx::query(
+        "INSERT INTO voice_admission_receipts
+         (thread_id, origin_id, voice_session_generation, queued_item_id, client_id, payload_json, admission_result)
+         VALUES (?, 'old-origin', 1, 'old-queue', 'old-origin', '{}', 'Queued')",
+    ).bind(thread_id.to_string()).execute(&pool).await.unwrap();
+    sqlx::query(
+        "INSERT INTO queued_items
+         (id, thread_id, payload_json, queue_order, created_at_ms, updated_at_ms)
+         VALUES ('old-queue', ?, '{}', 0, 0, 0)",
+    ).bind(thread_id.to_string()).execute(&pool).await.unwrap();
+    QUEUE_MIGRATOR.run(&pool).await.unwrap();
+    let native_session: Option<String> = sqlx::query_scalar(
+        "SELECT native_session_id FROM voice_admission_receipts WHERE origin_id = 'old-origin'",
+    ).fetch_one(&pool).await.unwrap();
+    assert_eq!(None, native_session);
+    assert!(sqlx::query(
+        "UPDATE voice_admission_receipts SET native_session_id = 'invented' WHERE origin_id = 'old-origin'",
+    ).execute(&pool).await.is_err());
+    pool.close().await;
+    let runtime = StateRuntime::init(sqlite, "test-provider".to_string()).await.unwrap();
+    let queue = runtime.thread_queue();
+    assert!(queue.get_voice_receipt(thread_id, "old-origin").await.is_err());
+    assert_eq!(None, queue.claim_voice(thread_id, "old-queue", "attempt").await.unwrap());
+    assert!(queue.reconcile_voice_started(thread_id, "invented", "old-origin", "old-origin", "turn").await.is_err());
+    assert_eq!(1, queue.list_page(thread_id, 0, 10).await.unwrap().len());
 }
 
 

@@ -1,9 +1,10 @@
 // Offline candidate. This module does not discover or connect to a Desktop host.
 import { randomUUID } from 'node:crypto';
+import { verifyPlaybackEvidence } from './playback-evidence.mjs';
 
 export const CANDIDATE_VERSION = 'FDV_NATIVE_VOICE_BOUNDARY_V1';
 const SCOPE_KEYS = ['threadId', 'nativeSessionId', 'voiceGeneration', 'ownerId'];
-const METHODS = ['setOutputMuted', 'playNativeOutput', 'invalidateJobs', 'stopPlayer', 'teardownVoice', 'reconcilePresentation'];
+const METHODS = ['observeLiveSession', 'setOutputMuted', 'playNativeOutput', 'invalidateJobs', 'stopPlayer', 'teardownVoice', 'reconcilePresentation'];
 const INDEPENDENT_COMPOSER_BLOCKERS = ['backendBusy', 'permissionPrompt', 'threadReadOnly'];
 
 function scopeOf(value) {
@@ -122,6 +123,49 @@ export function createNativeVoiceBoundary({ adapter, timeoutMs = 1000 } = {}) {
     return { allowed: true, reason: 'BOUNDARY_FENCE_ONLY', finalProvenanceAuthorized: false, scope: record.scope, jobGeneration };
   }
 
+  // The only combined readiness decision. The producer reader must be a trusted,
+  // synchronous current source+journal projection, never a saved PASS boolean.
+  // This candidate emits no TTS or player effect and no reusable playback token.
+  async function authorizeVaiPlayback({ scope: value, readProducerEvidence } = {}) {
+    let scope, record;
+    const deny = reason => Object.freeze({ status: 'HOLD', readyForTts: false, egressAuthorized: false, reason });
+    try {
+      scope = scopeOf(value); record = find(scope);
+      if (!record || !active(record)) return deny('STALE_OR_UNKNOWN_SCOPE');
+      if (typeof readProducerEvidence !== 'function') return deny('CURRENT_PRODUCER_READER_REQUIRED');
+      const fence = record.jobGeneration;
+      const before = gateVaiJob({ scope, jobGeneration: fence });
+      if (!before.allowed) return deny(before.reason);
+      await request(record, 'observeLiveSession', 'LIVE_SESSION_ACK', {},
+        { active: true, ownerCurrent: true, outputMuted: true, observation: 'SESSION_AND_SINK_READBACK' });
+      // No awaits from current producer readback through the final decision. An
+      // onset/close or a reentrant reader still invalidates the captured fence.
+      const raw = readProducerEvidence();
+      if (raw?.then) {
+        // Reject asynchronous proof, but consume a rejection so a contract error
+        // cannot crash the controller after returning HOLD. Never await/authorize it.
+        Promise.resolve(raw).catch(() => {});
+        return deny('SYNCHRONOUS_PRODUCER_READER_REQUIRED');
+      }
+      const identity = verifyPlaybackEvidence(copy(raw));
+      if (identity.thread_id !== scope.threadId || identity.native_session_id !== scope.nativeSessionId
+        || identity.voice_session_generation !== scope.voiceGeneration) return deny('LIVE_NATIVE_SESSION_IDENTITY_MISMATCH');
+      if (identity.job_generation !== fence) return deny('PRODUCER_JOB_GENERATION_MISMATCH');
+      const after = gateVaiJob({ scope, jobGeneration: identity.job_generation });
+      if (!after.allowed) return deny(after.reason);
+      const decision = Object.freeze({ status: 'READY_FOR_TTS', readyForTts: true,
+        egressAuthorized: false, executionScope: adapter.kind === 'FAKE' ? 'OFFLINE_FAKE' : 'NATIVE_ADAPTER_UNATTESTED',
+        authorizationOnly: true, scope: record.scope, identity, jobGeneration: fence,
+        producerProvenance: 'PASS', admissionReceipt: 'PASS', liveNativeSession: 'PASS',
+        boundaryGeneration: 'PASS', muteFence: 'PASS' });
+      emit(record, 'VAI_COMBINED_GATE_READY', { originId: identity.origin_id, turnId: identity.turn_id,
+        finalAgentItemId: identity.final_agent_item_id, egressAuthorized: false });
+      return decision;
+    } catch (error) {
+      return deny(String(error?.message ?? error));
+    }
+  }
+
   async function playNativeOutput(value) {
     const scope = scopeOf(value), record = find(scope);
     if (!record || !active(record) || record.state !== 'READY_MUTED' || !record.mutedAck) return { status: 'REJECTED_NOT_MUTED', scope };
@@ -224,5 +268,5 @@ export function createNativeVoiceBoundary({ adapter, timeoutMs = 1000 } = {}) {
     return Object.freeze({ scope: record.scope, state: record.state, isCurrent: active(record), jobGeneration: record.jobGeneration, outputMutedConfirmed: Boolean(record.mutedAck), pendingOnsets: record.pendingOnsets, seenOnsets: record.seenOnsets.size, errors: [...record.errors], composer: record.composer, adapterKind: adapter.kind });
   }
 
-  return Object.freeze({ beginSession, playNativeOutput, speechOnset, closeVoice, gateVaiJob, snapshot, events: () => copy(journal) });
+  return Object.freeze({ beginSession, playNativeOutput, speechOnset, closeVoice, gateVaiJob, authorizeVaiPlayback, snapshot, events: () => copy(journal) });
 }

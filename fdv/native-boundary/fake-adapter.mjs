@@ -11,6 +11,12 @@ export function createFakeAdapter(overrides = {}) {
     registerFakePlayer(jobId, scope, jobGeneration) { playerHandles.set(jobId, { scope, jobGeneration, stopped: false }); },
     microphoneActive: true,
     coreSubscriptionIdentity: 'FAKE_CORE_SUBSCRIPTION_UNCHANGED',
+    async observeLiveSession(request) {
+      const sink = sinks.get(key(request.scope));
+      return ack(request, 'LIVE_SESSION_ACK', { active: Boolean(sink && !sink.retired),
+        ownerCurrent: Boolean(sink && !sink.retired), outputMuted: sink?.muted === true,
+        observation: 'SESSION_AND_SINK_READBACK' });
+    },
     async setOutputMuted(request) {
       const sink = { muted: true, retired: false, playing: false };
       sinks.set(key(request.scope), sink);
@@ -36,7 +42,7 @@ export function createFakeAdapter(overrides = {}) {
     },
     async reconcilePresentation(request) { return ack(request, 'PRESENTATION_ACK', { presentationDetached: true, threadPreserved: true, backendSubscriptionsPreserved: true, composerUsable: true, independentBlockers: [] }); },
   };
-  for (const method of ['setOutputMuted', 'playNativeOutput', 'invalidateJobs', 'stopPlayer', 'teardownVoice', 'reconcilePresentation']) {
+  for (const method of ['observeLiveSession', 'setOutputMuted', 'playNativeOutput', 'invalidateJobs', 'stopPlayer', 'teardownVoice', 'reconcilePresentation']) {
     const implementation = overrides[method] ?? adapter[method];
     adapter[method] = async request => { calls.push({ method, request }); return implementation(request, adapter, ack); };
   }

@@ -69,6 +69,7 @@ pub trait QueueStore: Send + Sync {
     fn reconcile_voice_started(
         &self,
         _thread_id: ThreadId,
+        _native_session_id: String,
         _origin_id: String,
         _client_id: String,
         _turn_id: String,
@@ -204,12 +205,13 @@ impl QueueStore for LocalQueueStore {
     fn reconcile_voice_started(
         &self,
         thread_id: ThreadId,
+        native_session_id: String,
         origin_id: String,
         client_id: String,
         turn_id: String,
     ) -> ThreadStoreFuture<'_, VoiceAdmissionReceipt> {
         queue_future(async move {
-            self.queue().reconcile_voice_started(thread_id, &origin_id, &client_id, &turn_id).await
+            self.queue().reconcile_voice_started(thread_id, &native_session_id, &origin_id, &client_id, &turn_id).await
         })
     }
 

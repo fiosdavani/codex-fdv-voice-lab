@@ -2271,9 +2271,9 @@ impl Session {
         self.send_event_raw(event).await;
         self.maybe_notify_parent_of_terminal_turn(turn_context, &legacy_source)
             .await;
-        self.maybe_mirror_event_text_to_realtime(&legacy_source)
+        self.maybe_mirror_event_text_to_realtime(&turn_context.sub_id, &legacy_source)
             .await;
-        self.maybe_clear_realtime_handoff_for_event(&legacy_source)
+        self.maybe_clear_realtime_handoff_for_event(&turn_context.sub_id, &legacy_source)
             .await;
 
         let show_raw_agent_reasoning = self.show_raw_agent_reasoning();
@@ -2452,7 +2452,7 @@ impl Session {
         }
     }
 
-    async fn maybe_mirror_event_text_to_realtime(&self, msg: &EventMsg) {
+    async fn maybe_mirror_event_text_to_realtime(&self, turn_id: &str, msg: &EventMsg) {
         if self.conversation.running_state().await.is_none() {
             return;
         }
@@ -2461,6 +2461,7 @@ impl Session {
                 if let TurnItem::AgentMessage(item) = &event.item {
                     self.conversation
                         .register_handoff_stream_item(
+                            turn_id,
                             item.id.clone(),
                             item.phase.clone(),
                             agent_message_text(item),
@@ -2472,7 +2473,7 @@ impl Session {
             EventMsg::AgentMessageContentDelta(event) => {
                 if let Err(err) = self
                     .conversation
-                    .stream_handoff_delta(&event.item_id, event.delta.clone())
+                    .stream_handoff_delta(turn_id, &event.item_id, event.delta.clone())
                     .await
                 {
                     debug!("failed to stream event text to realtime conversation: {err}");
@@ -2481,7 +2482,7 @@ impl Session {
             }
             EventMsg::ItemCompleted(event) => {
                 if let TurnItem::AgentMessage(item) = &event.item
-                    && self.conversation.finish_handoff_stream_item(&item.id).await
+                    && self.conversation.finish_handoff_stream_item(turn_id, &item.id).await
                 {
                     return;
                 }
@@ -2491,19 +2492,19 @@ impl Session {
         let Some((text, phase)) = realtime_text_for_event(msg) else {
             return;
         };
-        if let Err(err) = self.conversation.handoff_out(text, phase).await {
+        if let Err(err) = self.conversation.handoff_out(turn_id, text, phase).await {
             debug!("failed to mirror event text to realtime conversation: {err}");
         }
     }
 
-    async fn maybe_clear_realtime_handoff_for_event(&self, msg: &EventMsg) {
+    async fn maybe_clear_realtime_handoff_for_event(&self, turn_id: &str, msg: &EventMsg) {
         if !matches!(msg, EventMsg::TurnComplete(_)) {
             return;
         }
-        if let Err(err) = self.conversation.handoff_complete().await {
+        if let Err(err) = self.conversation.handoff_complete(turn_id).await {
             debug!("failed to finalize realtime handoff output: {err}");
         }
-        self.conversation.clear_active_handoff().await;
+        self.conversation.clear_active_handoff(turn_id).await;
     }
 
     pub(crate) async fn send_event_raw(&self, event: Event) {

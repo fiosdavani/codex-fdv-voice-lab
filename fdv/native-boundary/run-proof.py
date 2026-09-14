@@ -1,76 +1,70 @@
 #!/usr/bin/env python3
-"""Run only this package's synthetic Node tests and preserve receipts locally."""
+"""Execute boundary and combined-gate suites; never infer coverage from file rc0."""
 from datetime import datetime, timezone
 from pathlib import Path
 import hashlib
 import json
 import os
 import re
-import shutil
 import subprocess
 import uuid
 
 ROOT = Path(__file__).resolve().parent
-SOURCES = ['index.mjs', 'index.d.ts', 'fake-adapter.mjs', 'test-native-boundary.mjs', 'README.md', 'run-proof.py']
-
+SOURCES = ['index.mjs', 'index.d.ts', 'fake-adapter.mjs', 'playback-evidence.mjs',
+           'test-native-boundary.mjs', 'test-combined-playback.mjs',
+           'fixtures/PLAYBACK-EVIDENCE-FAKE.json', 'README.md', 'run-proof.py']
 
 def sha(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
-
 def main():
-    node = shutil.which('node')
-    if node is None:
-        raise SystemExit('NODE_RUNTIME_UNAVAILABLE')
-    source_hashes = {name: sha(ROOT / name) for name in SOURCES}
-    destination = ROOT / ('proof-' + datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ') + '-' + uuid.uuid4().hex[:8])
-    destination.mkdir(exist_ok=False)
+    before = {name: sha(ROOT / name) for name in SOURCES}
+    out = ROOT / ('proof-' + datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ') + '-' + uuid.uuid4().hex[:8])
+    out.mkdir(exist_ok=False)
     runs = []
-
-    def execute(label, arguments, *, negative=False):
+    def run(label, args, negative=False):
         env = os.environ.copy()
-        env.pop('FDV_BOUNDARY_TEST_NEGATIVE', None)
-        if negative:
-            env['FDV_BOUNDARY_TEST_NEGATIVE'] = '1'
-        p = subprocess.run([node, *arguments], cwd=ROOT, env=env, text=True, capture_output=True, timeout=30)
-        (destination / (label + '.stdout.txt')).write_text(p.stdout)
-        (destination / (label + '.stderr.txt')).write_text(p.stderr)
-        entry = {'label': label, 'argv': [node, *arguments], 'negative_control': negative, 'rc': p.returncode}
-        runs.append(entry)
-        return p
-
-    runtime = execute('runtime', ['--version'])
-    checks = [execute('syntax-' + name, ['--check', name]) for name in ['index.mjs', 'fake-adapter.mjs', 'test-native-boundary.mjs']]
-    standard = execute('node-test', ['--test', 'test-native-boundary.mjs'])
-    detailed = execute('node-test-detailed', ['test-native-boundary.mjs'])
-    negative = execute('negative-node-test', ['--test', 'test-native-boundary.mjs'], negative=True)
-    negative_detailed = execute('negative-detailed', ['test-native-boundary.mjs'], negative=True)
-    tests = re.search(r'^# tests (\d+)$', detailed.stdout, re.M)
-    passes = re.search(r'^# pass (\d+)$', detailed.stdout, re.M)
-    fails = re.search(r'^# fail (\d+)$', detailed.stdout, re.M)
-    executed = int(tests[1]) if tests else 0
-    unchanged = source_hashes == {name: sha(ROOT / name) for name in SOURCES}
-    success = all(p.returncode == 0 for p in [runtime, *checks, standard, detailed]) and executed == 30 and passes and int(passes[1]) == 30 and fails and int(fails[1]) == 0 and negative.returncode != 0 and negative_detailed.returncode != 0 and 'INTENTIONAL_NEGATIVE_CONTROL' in negative_detailed.stdout and unchanged
-    receipt = {
-        'schema': 'FDV_NATIVE_BOUNDARY_OFFLINE_PROOF_V1',
-        'created_at': datetime.now(timezone.utc).isoformat(),
-        'node': runtime.stdout.strip(), 'node_path': node,
-        'adapter': 'FAKE', 'source_hashes': source_hashes,
-        'source_unchanged': unchanged, 'runs': runs,
-        'scenarios_executed': executed,
-        'offline_boundary_proof': 'PASS' if success else 'FAIL',
-        'negative_control': 'DETECTED' if negative.returncode and negative_detailed.returncode and 'INTENTIONAL_NEGATIVE_CONTROL' in negative_detailed.stdout else 'FAIL',
-        'installed_native_hookup': 'NC', 'real_v3_onset': 'NC',
-        'windows_audio': 'NOT_EXECUTED', 'voice_calls': 0, 'network_calls': 0,
-        'state_persistence': 'MEMORY_ONLY_NOT_PROVED_ACROSS_RESTART',
-        'typescript_typecheck': 'NOT_EXECUTED',
-    }
-    (destination / 'RECEIPT.json').write_text(json.dumps(receipt, ensure_ascii=False, indent=2) + '\n')
-    entries = ''.join(f'{sha(p)}  {p.name}\n' for p in sorted(destination.iterdir()) if p.is_file())
-    (destination / 'SHA256SUMS').write_text(entries)
-    print(json.dumps({'proof_path': str(destination), 'receipt_sha256': sha(destination / 'RECEIPT.json'), 'OFFLINE_BOUNDARY_PROOF': receipt['offline_boundary_proof'], 'SCENARIOS_EXECUTED': executed, 'NEGATIVE_CONTROL': receipt['negative_control'], 'REAL_NATIVE_HOOKUP': 'NC'}, ensure_ascii=False))
+        for key in ['FDV_BOUNDARY_TEST_NEGATIVE', 'FDV_COMBINED_TEST_NEGATIVE']:
+            env.pop(key, None)
+            if negative:
+                env[key] = '1'
+        result = subprocess.run(['node', *args], cwd=ROOT, env=env, capture_output=True, text=True, timeout=30)
+        (out / (label + '.stdout.txt')).write_text(result.stdout)
+        (out / (label + '.stderr.txt')).write_text(result.stderr)
+        runs.append({'argv': ['node', *args], 'label': label, 'negative_control': negative, 'rc': result.returncode})
+        return result
+    checks = [run('runtime', ['--version'])]
+    for name in SOURCES:
+        if name.endswith('.mjs'):
+            checks.append(run('syntax-' + name, ['--check', name]))
+    suites = []
+    for name in ['test-native-boundary.mjs', 'test-combined-playback.mjs']:
+        standard = run(name + '-runner', ['--test', name])
+        detailed = run(name + '-detailed', [name])
+        negative = run(name + '-negative', ['--test', name], True)
+        negative_detail = run(name + '-negative-detailed', [name], True)
+        counts = {k: int(m[1]) if (m := re.search(r'^# ' + k + r' (\d+)$', detailed.stdout, re.M)) else None
+                  for k in ['tests', 'pass', 'fail', 'skipped', 'cancelled']}
+        good = (standard.returncode == detailed.returncode == 0 and counts == {
+            'tests': 30, 'pass': 30, 'fail': 0, 'skipped': 0, 'cancelled': 0}
+            and negative.returncode != 0 and negative_detail.returncode != 0
+            and 'INTENTIONAL_NEGATIVE_CONTROL' in negative_detail.stdout)
+        suites.append({'file': name, 'counts': counts, 'result': 'PASS' if good else 'FAIL',
+                       'negative_control_detected': negative.returncode != 0 and negative_detail.returncode != 0})
+    unchanged = before == {name: sha(ROOT / name) for name in SOURCES}
+    success = unchanged and all(p.returncode == 0 for p in checks) and all(x['result'] == 'PASS' for x in suites)
+    receipt = {'schema': 'fdv.native.combined.delta.proof.v1', 'result': 'PASS' if success else 'FAIL',
+               'source_hashes': before, 'source_unchanged': unchanged, 'suites': suites, 'runs': runs,
+               'scenarios': sum(s['counts']['tests'] or 0 for s in suites),
+               'runtime': checks[0].stdout.strip(), 'adapter': 'FAKE',
+               'windows': False, 'voice': False, 'elevenlabs': False, 'production': False,
+               'typescript_typecheck': 'PENDING_NEW_DELTA_NOT_EXECUTED',
+               'native_readback_authentication': 'NC_OFFLINE_FAKE_ONLY'}
+    (out / 'RECEIPT.json').write_text(json.dumps(receipt, indent=2) + '\n')
+    (out / 'SHA256SUMS').write_text(''.join(f'{sha(f)}  {f.name}\n' for f in sorted(out.iterdir()) if f.is_file()))
+    print(json.dumps({'result': receipt['result'], 'scenarios': receipt['scenarios'],
+                      'receipt': str(out / 'RECEIPT.json'), 'sha256': sha(out / 'RECEIPT.json')}))
     raise SystemExit(0 if success else 1)
-
 
 if __name__ == '__main__':
     main()

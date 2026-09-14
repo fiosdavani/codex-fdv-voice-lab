@@ -11,7 +11,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 FREEZE_SHA256 = '7a7c48d0c9d67b4f1e281306264b40e240d7c51e380a5cff6ec0aaf0df624bcb'
-MATCH_FIELDS = ('thread_id', 'voice_session_generation', 'origin_id',
+MATCH_FIELDS = ('thread_id', 'native_session_id', 'voice_session_generation', 'origin_id',
                 'client_id', 'queued_item_id', 'input_digest')
 RECEIPT_REQUIRED = ('schema', 'receipt_id', *MATCH_FIELDS,
                     'turn_id', 'admission_result')
@@ -57,12 +57,18 @@ def verdict(status, reason, receipt=None, authorization=None):
             'receipt_sha256': digest(receipt) if receipt is not None else None,
             'authorization_sha256': digest(authorization) if authorization is not None else None,
             'voice_session_generation': receipt.get('voice_session_generation') if receipt else None,
+            'native_session_id': receipt.get('native_session_id') if receipt else None,
+            'job_generation': authorization.get('job_generation') if authorization else None,
             'origin_id': receipt.get('origin_id') if receipt else None,
             'queued_item_id': receipt.get('queued_item_id') if receipt else None}
 
 
 def valid_generation(value):
-    return type(value) is int and value >= 1
+    return type(value) is int and 1 <= value <= 9007199254740991
+
+
+def valid_job_generation(value):
+    return type(value) is int and 0 <= value <= 9007199254740991
 
 
 def evaluate_final_admission(record, receipts, authorization):
@@ -102,19 +108,28 @@ def evaluate_final_admission(record, receipts, authorization):
             or authorization.get('state') != 'Active'
             or any(k not in authorization for k in MATCH_FIELDS)
             or not valid_generation(authorization.get('voice_session_generation'))
+            or not valid_job_generation(authorization.get('job_generation'))
             or any(not nonempty(authorization.get(k)) for k in
-                   ('thread_id', 'origin_id', 'client_id', 'queued_item_id'))
+                   ('thread_id', 'native_session_id', 'origin_id', 'client_id', 'queued_item_id'))
             or authorization['client_id'] != authorization['origin_id']
             or (authorization['input_digest'] is not None
                 and not nonempty(authorization['input_digest']))):
         return verdict('HOLD_NC_PROVENANCE', 'AUTHORIZATION_INACTIVE_OR_INVALID')
     if authorization['thread_id'] != thread:
         return verdict('HOLD_NC_PROVENANCE', 'AUTHORIZATION_THREAD_MISMATCH')
-    job_generation = record.get('job_voice_session_generation')
-    if job_generation is not None and (
-            not valid_generation(job_generation)
-            or job_generation != authorization['voice_session_generation']):
+    voice_generation = record.get('job_voice_session_generation')
+    if voice_generation is not None and (
+            not valid_generation(voice_generation)
+            or voice_generation != authorization['voice_session_generation']):
         return verdict('HOLD_NC_PROVENANCE', 'JOB_GENERATION_SNAPSHOT_MISMATCH')
+    native_session = record.get('job_native_session_id')
+    if native_session is not None and native_session != authorization['native_session_id']:
+        return verdict('HOLD_NC_PROVENANCE', 'JOB_NATIVE_SESSION_SNAPSHOT_MISMATCH')
+    job_generation = record.get('job_generation')
+    if job_generation is not None and (
+            not valid_job_generation(job_generation)
+            or job_generation != authorization['job_generation']):
+        return verdict('HOLD_NC_PROVENANCE', 'JOB_PLAYBACK_GENERATION_SNAPSHOT_MISMATCH')
     if not isinstance(receipts, (list, tuple)):
         return verdict('HOLD_NC_PROVENANCE', 'RECEIPT_SNAPSHOT_REQUIRED')
     relevant = [r for r in receipts if isinstance(r, dict)
@@ -129,7 +144,7 @@ def evaluate_final_admission(record, receipts, authorization):
             or receipt.get('receipt_id') != receipt.get('queued_item_id')
             or not valid_generation(receipt.get('voice_session_generation'))
             or any(not nonempty(receipt.get(k)) for k in
-                   ('receipt_id', 'thread_id', 'origin_id', 'client_id', 'queued_item_id'))
+                   ('receipt_id', 'thread_id', 'native_session_id', 'origin_id', 'client_id', 'queued_item_id'))
             or receipt.get('client_id') != receipt.get('origin_id')
             or any(receipt.get(k) is not None and not nonempty(receipt[k])
                    for k in ('handoff_id', 'item_id', 'attempt_id'))
@@ -149,3 +164,70 @@ def evaluate_final_admission(record, receipts, authorization):
         return verdict('HOLD_NC_PROVENANCE', 'COMMITTED_ADMISSION_RECEIPT_CHANGED')
     return verdict('ELIGIBLE_FAKE_ONLY', 'EXACT_RECEIPT_AUTHORIZATION_AND_SQL_JOIN',
                    receipt, authorization)
+
+
+
+def build_playback_evidence(record, receipts, authorization):
+    """Produce a provenance packet, never permission to synthesize/play.
+
+    Caller must supply a record enriched from the exact owned candidate journal
+    through final_producer.read_playback_evidence. Fields are rechecked rather
+    than trusting a pass boolean. A dictionary is not an authenticated capability:
+    the combined native gate must independently inspect current session/fences.
+    """
+    decision = evaluate_final_admission(record, receipts, authorization)
+    if not decision['eligible_fake_only']:
+        raise ValueError('PLAYBACK_EVIDENCE_HOLD:' + decision['reason'])
+    if (record.get('journal_status') != 'ELIGIBLE_FAKE_ONLY'
+            or record.get('job_native_session_id') != authorization['native_session_id']
+            or record.get('job_voice_session_generation') != authorization['voice_session_generation']
+            or record.get('job_generation') != authorization['job_generation']
+            or record.get('job_receipt_sha256') != decision['receipt_sha256']
+            or record.get('journal_original_version_sha256') != record.get('version_sha256')
+            or record.get('journal_text_sha256') != record.get('text_sha256')):
+        raise ValueError('PLAYBACK_EVIDENCE_HOLD:IMMUTABLE_JOURNAL_PROOF_REQUIRED')
+    receipt = next(r for r in receipts if r.get('queued_item_id') == authorization['queued_item_id'])
+    final = json.loads(record['item_json'])
+    text = final.get('text')
+    if (not isinstance(text, str) or not text.strip()
+            or hashlib.sha256(text.encode('utf-8')).hexdigest() != record['text_sha256']):
+        raise ValueError('PLAYBACK_EVIDENCE_HOLD:TEXT_HASH_MISMATCH')
+    thread, turn, item_id = record['identity']
+    packet = {
+        'schema': 'fdv.voice.playback.evidence.v1',
+        'identity': {
+            'thread_id': thread, 'native_session_id': receipt['native_session_id'],
+            'voice_session_generation': receipt['voice_session_generation'],
+            'origin_id': receipt['origin_id'], 'client_id': receipt['client_id'],
+            'queued_item_id': receipt['queued_item_id'], 'turn_id': turn,
+            'final_agent_item_id': item_id,
+            'first_user_item_id': record['first_user_item_id'],
+            'job_generation': record['job_generation'],
+        },
+        'source': {
+            'classification': record['classification'], 'turn_status': 'completed',
+            'final_pointer': record['final_pointer'], 'final_item_id': record['final_item_id'],
+            'final_item': {**{k: final[k] for k in ('id', 'type', 'text', 'phase', 'delivery')},
+                           'questions': final.get('questions')},
+            'first_user_item_id': record['first_user_item_id'],
+            'first_user': record['first_user'],
+            'version_sha256': record['version_sha256'], 'text_sha256': record['text_sha256'],
+        },
+        'journal': {
+            'status': record['journal_status'],
+            'original_version_sha256': record['journal_original_version_sha256'],
+            'text_sha256': record['journal_text_sha256'],
+            'native_session_id': record['job_native_session_id'],
+            'voice_session_generation': record['job_voice_session_generation'],
+            'job_generation': record['job_generation'],
+            'original_receipt_sha256': record['job_receipt_sha256'],
+        },
+        'admission_receipt': receipt, 'authorization': authorization,
+        'receipt_sha256': decision['receipt_sha256'],
+        'authorization_sha256': decision['authorization_sha256'],
+        'provenance_only': True, 'egress_authorized': False,
+        'source_payload_digest_verified': False,
+    }
+    # Detached serialized value: later mutation of caller inputs cannot rewrite
+    # this already captured packet. It is still a snapshot, not live authority.
+    return json.loads(json.dumps(packet, ensure_ascii=False))
