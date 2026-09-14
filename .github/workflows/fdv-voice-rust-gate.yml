@@ -25,9 +25,6 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: '0'
       RUST_BACKTRACE: '1'
       RUST_MIN_STACK: '8388608'
-      RUSTUP_HOME: ${{ runner.temp }}/fdv-rustup
-      CARGO_HOME: ${{ runner.temp }}/fdv-cargo
-      TMPDIR: ${{ runner.temp }}/fdv-tmp
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
@@ -37,7 +34,10 @@ jobs:
         id: chain
         shell: bash
         run: |
-          mkdir -p "$TMPDIR" "$RUNNER_TEMP/fdv-receipts"
+          mkdir -p "$RUNNER_TEMP/fdv-tmp" "$RUNNER_TEMP/fdv-receipts"
+          echo "RUSTUP_HOME=$RUNNER_TEMP/fdv-rustup" >> "$GITHUB_ENV"
+          echo "CARGO_HOME=$RUNNER_TEMP/fdv-cargo" >> "$GITHUB_ENV"
+          echo "TMPDIR=$RUNNER_TEMP/fdv-tmp" >> "$GITHUB_ENV"
           test "$(id -u)" != 0
           python3 -B fdv-ci/verify_chain.py --repo "$GITHUB_WORKSPACE" --out "$RUNNER_TEMP/fdv-receipts" --worktree "$RUNNER_TEMP/fdv-chain-check"
       - name: Exact private Rust toolchain
