@@ -236,6 +236,7 @@ fn streamed_handoff_preserves_a_bounded_final_tail() {
     let mut item = RealtimeStreamedItem {
         turn_id: "test-turn".to_string(),
         handoff_id: "handoff_1".to_string(),
+        output_cancellation: None,
         phase: Some(MessagePhase::FinalAnswer),
         bem_channel_parser: None,
         prefix_final_message: true,
@@ -267,6 +268,7 @@ fn streamed_v3_handoff_omits_the_final_message_prefix() {
     let mut item = RealtimeStreamedItem {
         turn_id: "test-turn".to_string(),
         handoff_id: "handoff_1".to_string(),
+        output_cancellation: None,
         phase: Some(MessagePhase::FinalAnswer),
         bem_channel_parser: None,
         prefix_final_message: false,

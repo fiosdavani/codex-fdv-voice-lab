@@ -2498,13 +2498,9 @@ impl Session {
     }
 
     async fn maybe_clear_realtime_handoff_for_event(&self, turn_id: &str, msg: &EventMsg) {
-        if !matches!(msg, EventMsg::TurnComplete(_)) {
-            return;
-        }
-        if let Err(err) = self.conversation.handoff_complete(turn_id).await {
+        if let Err(err) = self.conversation.handle_terminal_handoff_event(turn_id, msg).await {
             debug!("failed to finalize realtime handoff output: {err}");
         }
-        self.conversation.clear_active_handoff(turn_id).await;
     }
 
     pub(crate) async fn send_event_raw(&self, event: Event) {

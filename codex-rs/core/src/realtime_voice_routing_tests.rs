@@ -50,3 +50,45 @@ fn mismatched_session_and_unknown_client_id_never_gain_routes() {
     routes.started("turn-B", Some("not-the-origin")).unwrap();
     assert_eq!(routes.binding("turn-B"), None);
 }
+
+#[test]
+fn aborted_origin_keeps_its_tombstone_and_cancels_cloned_emission_tokens() {
+    let scope = VoiceAdmissionScope { native_session_id: "native-A".into(), voice_session_generation: 1 };
+    let mut routes = VoiceTurnRoutes::new(scope.clone());
+    let a = origin(&scope, "origin-A");
+    let b = origin(&scope, "origin-B");
+    routes.received(&a).unwrap();
+    routes.started("turn-A", Some("origin-A")).unwrap();
+    let (_, cancellation_a) = routes.output_route("turn-A").unwrap();
+    routes.received(&b).unwrap();
+    routes.abort("turn-A");
+    assert!(cancellation_a.is_cancelled());
+    assert_eq!(routes.binding("turn-A"), None);
+    assert!(routes.output_route("turn-A").is_none());
+    assert!(!routes.was_started("handoff-origin-A"));
+    routes.received(&a).unwrap();
+    assert!(routes.started("turn-A", Some("origin-A")).is_err());
+    assert!(routes.started("retry-A", Some("origin-A")).is_err());
+    routes.started("turn-B", Some("origin-B")).unwrap();
+    let (_, cancellation_b) = routes.output_route("turn-B").unwrap();
+    routes.abort("turn-A");
+    routes.complete("turn-A");
+    assert!(routes.binding("turn-B").is_some());
+    assert!(!cancellation_b.is_cancelled());
+}
+
+#[test]
+fn completed_origin_cancels_new_emissions_but_retains_successful_final_identity() {
+    let scope = VoiceAdmissionScope { native_session_id: "native-A".into(), voice_session_generation: 1 };
+    let mut routes = VoiceTurnRoutes::new(scope.clone());
+    routes.received(&origin(&scope, "origin-A")).unwrap();
+    routes.started("turn-A", Some("origin-A")).unwrap();
+    let (_, cancellation) = routes.output_route("turn-A").unwrap();
+    routes.complete("turn-A");
+    assert!(cancellation.is_cancelled());
+    assert_eq!(routes.binding("turn-A"), None);
+    assert!(routes.was_started("handoff-origin-A"));
+    assert!(routes.started("turn-A", Some("origin-A")).is_err());
+    routes.complete("turn-A");
+    assert!(routes.was_started("handoff-origin-A"));
+}

@@ -235,6 +235,7 @@ struct RealtimeHandoffStreamState {
 struct RealtimeStreamedItem {
     turn_id: String,
     handoff_id: String,
+    output_cancellation: Option<CancellationToken>,
     phase: Option<MessagePhase>,
     bem_channel_parser: Option<BemChannelParser>,
     prefix_final_message: bool,
@@ -971,21 +972,27 @@ impl RealtimeConversationManager {
             phase
         };
         let is_commentary = matches!(phase, Some(MessagePhase::Commentary));
-        let active_handoff = if let Some(routes) = &handoff.voice_routes {
-            let route = routes.lock().await.binding(turn_id).cloned();
+        let (active_handoff, output_cancellation) = if let Some(routes) = &handoff.voice_routes {
+            let route = routes.lock().await.output_route(turn_id);
             // Strict mode never falls back to an anonymous/standalone handoff.
-            let Some(route) = route else { return Ok(()); };
-            Some(route.handoff_id)
+            let Some((route, cancellation)) = route else { return Ok(()); };
+            (Some(route.handoff_id), Some(cancellation))
         } else {
-            handoff.stream.lock().await.active_handoff.clone()
+            (handoff.stream.lock().await.active_handoff.clone(), None)
         };
         let output = match active_handoff {
             Some(handoff_id) => {
                 let output_text = realtime_backend_output(output_text, handoff.session_kind);
-                handoff.last_output.lock().await.insert(turn_id.to_string(), RealtimeHandoffOutput {
-                    text: output_text.clone(),
-                    phase: phase.clone(),
-                });
+                {
+                    let mut last_output = handoff.last_output.lock().await;
+                    if output_cancellation.as_ref().is_some_and(CancellationToken::is_cancelled) {
+                        return Ok(());
+                    }
+                    last_output.insert(turn_id.to_string(), RealtimeHandoffOutput {
+                        text: output_text.clone(),
+                        phase: phase.clone(),
+                    });
+                }
                 if handoff.codex_responses_as_items {
                     RealtimeOutbound::ConversationItem {
                         text: realtime_backend_item(
@@ -1031,11 +1038,7 @@ impl RealtimeConversationManager {
                 }
             }
         };
-        handoff
-            .output_tx
-            .send(output)
-            .await
-            .map_err(|_| CodexErr::InvalidRequest("conversation is not running".to_string()))?;
+        send_handoff_output(&handoff, output, output_cancellation.as_ref()).await?;
         Ok(())
     }
 
@@ -1056,20 +1059,27 @@ impl RealtimeConversationManager {
         if !handoff.streams_handoff_append() {
             return;
         }
-        let handoff_id = if let Some(routes) = &handoff.voice_routes {
-            routes.lock().await.binding(turn_id).map(|route| route.handoff_id.clone())
+        let (handoff_id, output_cancellation) = if let Some(routes) = &handoff.voice_routes {
+            let Some((route, cancellation)) = routes.lock().await.output_route(turn_id) else {
+                return;
+            };
+            (Some(route.handoff_id), Some(cancellation))
         } else {
-            handoff.stream.lock().await.active_handoff.clone()
+            (handoff.stream.lock().await.active_handoff.clone(), None)
         };
         let Some(handoff_id) = handoff_id else { return; };
         let flush_delay = {
             let mut stream = handoff.stream.lock().await;
+            if output_cancellation.as_ref().is_some_and(CancellationToken::is_cancelled) {
+                return;
+            }
             if stream.items.get(&item_id).is_some_and(|item| item.turn_id != turn_id) {
                 return;
             }
             let mut streamed_item = RealtimeStreamedItem {
                 turn_id: turn_id.to_string(),
                 handoff_id,
+                output_cancellation,
                 phase: if handoff.routes_handoff_by_bem() {
                     None
                 } else {
@@ -1163,18 +1173,23 @@ impl RealtimeConversationManager {
             stream.items.remove(item_id)
         };
         let Some(mut streamed_item) = streamed_item else { return false; };
+        if streamed_item.output_cancellation.as_ref().is_some_and(CancellationToken::is_cancelled) {
+            return false;
+        }
         streamed_item.finish_input();
         let chunk = streamed_item.drain_final_chunk();
         let sent_output = streamed_item.sent_bytes > 0;
         if let Some(text) = chunk {
-            let _ = handoff
-                .output_tx
-                .send(RealtimeOutbound::HandoffAppend {
+            let result = send_handoff_output(
+                &handoff,
+                RealtimeOutbound::HandoffAppend {
                     handoff_id: streamed_item.handoff_id,
                     text,
                     phase: streamed_item.phase,
-                })
-                .await;
+                },
+                streamed_item.output_cancellation.as_ref(),
+            ).await;
+            if matches!(result, Ok(false)) { return false; }
         }
         sent_output
     }
@@ -1223,10 +1238,13 @@ impl RealtimeConversationManager {
             RealtimeSessionKind::V2 => {}
         }
 
-        let handoff_id = if let Some(routes) = &handoff.voice_routes {
-            routes.lock().await.binding(turn_id).map(|route| route.handoff_id.clone())
+        let (handoff_id, output_cancellation) = if let Some(routes) = &handoff.voice_routes {
+            let Some((route, cancellation)) = routes.lock().await.output_route(turn_id) else {
+                return Ok(());
+            };
+            (Some(route.handoff_id), Some(cancellation))
         } else {
-            handoff.stream.lock().await.active_handoff.clone()
+            (handoff.stream.lock().await.active_handoff.clone(), None)
         };
         let Some(handoff_id) = handoff_id else { return Ok(()); };
         let Some(last_output) = handoff.last_output.lock().await.get(turn_id).cloned() else {
@@ -1243,11 +1261,37 @@ impl RealtimeConversationManager {
             }
         };
 
-        handoff
-            .output_tx
-            .send(output)
-            .await
-            .map_err(|_| CodexErr::InvalidRequest("conversation is not running".to_string()))
+        send_handoff_output(&handoff, output, output_cancellation.as_ref()).await?;
+        Ok(())
+    }
+
+    /// The turn ID comes from Session's TurnContext, not the optional event payload.
+    pub(crate) async fn handle_terminal_handoff_event(
+        &self, turn_id: &str, msg: &EventMsg,
+    ) -> CodexResult<()> {
+        match msg {
+            EventMsg::TurnComplete(_) => {
+                let result = self.handoff_complete(turn_id).await;
+                self.clear_active_handoff(turn_id).await;
+                result
+            }
+            EventMsg::TurnAborted(_) => {
+                self.retire_strict_voice_turn(turn_id).await;
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    pub(crate) async fn retire_strict_voice_turn(&self, turn_id: &str) {
+        let handoff = self.state.lock().await.as_ref().map(|state| state.handoff.clone());
+        let Some(handoff) = handoff else { return; };
+        let Some(routes) = &handoff.voice_routes else { return; };
+        // Cancel before taking stream/last_output locks: stale producers recheck
+        // under those locks, and blocked sends wake without retaining a route lock.
+        routes.lock().await.abort(turn_id);
+        handoff.stream.lock().await.items.retain(|_, item| item.turn_id != turn_id);
+        handoff.last_output.lock().await.remove(turn_id);
     }
 
     pub(crate) async fn clear_active_handoff(&self, turn_id: &str) {
@@ -2269,13 +2313,37 @@ async fn handle_text_input(
     Ok(())
 }
 
+/// Cancellation covers delayed/blocked emission, not frames already enqueued.
+/// Never hold the route mutex across a bounded send: the consumer also uses it.
+async fn send_handoff_output(
+    handoff: &RealtimeHandoffState,
+    output: RealtimeOutbound,
+    cancellation: Option<&CancellationToken>,
+) -> CodexResult<bool> {
+    let send = handoff.output_tx.send(output);
+    let result = if let Some(cancellation) = cancellation {
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Ok(false),
+            result = send => result,
+        }
+    } else {
+        send.await
+    };
+    result.map_err(|_| CodexErr::InvalidRequest("conversation is not running".to_string()))?;
+    Ok(true)
+}
+
 async fn flush_streamed_handoff_item(handoff: &RealtimeHandoffState, turn_id: &str, item_id: &str) {
-    let (handoff_id, text, phase) = {
+    let (handoff_id, text, phase, output_cancellation) = {
         let mut stream = handoff.stream.lock().await;
         let Some(streamed_item) = stream.items.get_mut(item_id) else {
             return;
         };
         if streamed_item.turn_id != turn_id { return; }
+        if streamed_item.output_cancellation.as_ref().is_some_and(CancellationToken::is_cancelled) {
+            return;
+        }
         streamed_item.flush_scheduled = false;
         let Some(text) = streamed_item.drain_stream_chunk() else {
             return;
@@ -2285,16 +2353,18 @@ async fn flush_streamed_handoff_item(handoff: &RealtimeHandoffState, turn_id: &s
             streamed_item.handoff_id.clone(),
             text,
             streamed_item.phase.clone(),
+            streamed_item.output_cancellation.clone(),
         )
     };
-    let _ = handoff
-        .output_tx
-        .send(RealtimeOutbound::HandoffAppend {
+    let _ = send_handoff_output(
+        handoff,
+        RealtimeOutbound::HandoffAppend {
             handoff_id,
             text,
             phase,
-        })
-        .await;
+        },
+        output_cancellation.as_ref(),
+    ).await;
 }
 
 fn schedule_streamed_handoff_flush(

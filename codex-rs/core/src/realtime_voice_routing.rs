@@ -7,6 +7,7 @@ use std::collections::HashMap;
 
 use codex_extension_api::VoiceAdmissionInput;
 use codex_extension_api::VoiceAdmissionScope;
+use tokio_util::sync::CancellationToken;
 
 const MAX_SESSION_ORIGINS: usize = 4096;
 
@@ -26,6 +27,7 @@ struct ReceivedOrigin {
     item_id: Option<String>,
     turn_id: Option<String>,
     completed: bool,
+    output_cancellation: CancellationToken,
 }
 
 #[derive(Debug)]
@@ -59,6 +61,7 @@ impl VoiceTurnRoutes {
         self.origins.insert(input.origin_id.clone(), ReceivedOrigin {
             handoff_id: handoff_id.to_string(), item_id: input.item_id.clone(),
             turn_id: None, completed: false,
+            output_cancellation: CancellationToken::new(),
         });
         Ok(())
     }
@@ -98,6 +101,14 @@ impl VoiceTurnRoutes {
         (!self.origins.get(&binding.origin_id)?.completed).then_some(binding)
     }
 
+    pub(crate) fn output_route(
+        &self, turn_id: &str,
+    ) -> Option<(VoiceTurnBinding, CancellationToken)> {
+        let binding = self.binding(turn_id)?;
+        let origin = self.origins.get(&binding.origin_id)?;
+        Some((binding.clone(), origin.output_cancellation.clone()))
+    }
+
     /// Queued outbound frames carry their handoff identity already. A completed
     /// origin remains known so its final queued frame can drain after TurnComplete.
     pub(crate) fn was_started(&self, handoff_id: &str) -> bool {
@@ -109,7 +120,15 @@ impl VoiceTurnRoutes {
             && let Some(origin) = self.origins.get_mut(&binding.origin_id)
         {
             origin.completed = true;
+            origin.output_cancellation.cancel();
         }
+    }
+
+    /// Retain the origin tombstone, but do not authorize aborted final frames.
+    /// A duplicate arrival/start must never create a fresh emission token.
+    pub(crate) fn abort(&mut self, turn_id: &str) {
+        self.complete(turn_id);
+        self.turns.remove(turn_id);
     }
 }
 

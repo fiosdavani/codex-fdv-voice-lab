@@ -5,6 +5,43 @@ use super::*;
 use codex_protocol::ThreadId;
 use pretty_assertions::assert_eq;
 
+fn aborted_event() -> EventMsg {
+    EventMsg::TurnAborted(codex_protocol::protocol::TurnAbortedEvent {
+        // The dispatcher must use the TurnContext argument, not this optional ID.
+        turn_id: Some("not-the-turn-context".into()),
+        reason: codex_protocol::protocol::TurnAbortReason::Interrupted,
+        started_at: None,
+        completed_at: None,
+        duration_ms: None,
+    })
+}
+
+fn completed_event(turn_id: &str) -> EventMsg {
+    EventMsg::TurnComplete(codex_protocol::protocol::TurnCompleteEvent {
+        turn_id: turn_id.into(),
+        last_agent_message: None,
+        error: None,
+        started_at: None,
+        completed_at: None,
+        duration_ms: None,
+        time_to_first_token_ms: None,
+    })
+}
+
+async fn buffer_without_timer(
+    manager: &RealtimeConversationManager,
+    state: &RealtimeHandoffState,
+    turn_id: &str,
+    item_id: &str,
+) {
+    manager.register_handoff_stream_item(turn_id, item_id.into(), None, String::new()).await;
+    // Deterministic fixture: exercise the real flush function without wall-clock sleeps.
+    let mut stream = state.stream.lock().await;
+    let item = stream.items.get_mut(item_id).unwrap();
+    item.push_text("buffered output");
+    item.flush_scheduled = true;
+}
+
 fn handoff(id: &str) -> RealtimeHandoffRequested {
     RealtimeHandoffRequested {
         handoff_id: id.to_string(), item_id: format!("item-{id}"),
@@ -147,5 +184,143 @@ async fn frameless_stream_items_and_delayed_completion_are_turn_bound() {
     assert_eq!(output.recv().await.unwrap(), RealtimeOutbound::HandoffAppend {
         handoff_id: "B".into(), text: "output B".into(), phase: None,
     });
+    manager.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn aborted_event_retires_a_and_preserves_pending_and_started_b() {
+    let (manager, state, output, scope) = manager(RealtimeEventParser::FramelessBidi).await;
+    let a = voice_admission_input(ThreadId::new(), &scope, &handoff("A"), "A".into()).unwrap();
+    let b = voice_admission_input(a.thread_id, &scope, &handoff("B"), "B".into()).unwrap();
+    manager.remember_voice_origin(&a).await.unwrap();
+    manager.activate_voice_turn("turn-A", Some(&a.origin_id)).await.unwrap();
+    let cancellation_a = state.voice_routes.as_ref().unwrap().lock().await
+        .output_route("turn-A").unwrap().1;
+    buffer_without_timer(&manager, &state, "turn-A", "item-A").await;
+    manager.handoff_out("turn-A", "last A".into(), None).await.unwrap();
+    assert!(matches!(output.recv().await.unwrap(), RealtimeOutbound::HandoffUpdate { handoff_id, .. } if handoff_id == "A"));
+    manager.remember_voice_origin(&b).await.unwrap();
+    assert_eq!(state.receive_handoff(&handoff("B")).await, HandoffArrivalEffect::Queued);
+
+    // Same dispatcher called by Session::maybe_clear_realtime_handoff_for_event.
+    manager.handle_terminal_handoff_event("turn-A", &aborted_event()).await.unwrap();
+    assert!(output.is_empty()); // Abort must never emit CompletedHandoff.
+    assert!(cancellation_a.is_cancelled());
+    assert!(state.voice_routes.as_ref().unwrap().lock().await.binding("turn-A").is_none());
+    assert!(!state.voice_routes.as_ref().unwrap().lock().await.was_started("A"));
+    assert!(state.voice_routes.as_ref().unwrap().lock().await.binding("turn-B").is_none());
+    assert!(!state.voice_routes.as_ref().unwrap().lock().await.was_started("B"));
+    assert!(!state.stream.lock().await.items.contains_key("item-A"));
+    assert!(!state.last_output.lock().await.contains_key("turn-A"));
+    manager.remember_voice_origin(&a).await.unwrap();
+    assert!(manager.activate_voice_turn("turn-A", Some(&a.origin_id)).await.is_err());
+    assert!(manager.activate_voice_turn("retry-A", Some(&a.origin_id)).await.is_err());
+    flush_streamed_handoff_item(&state, "turn-A", "item-A").await;
+    manager.register_handoff_stream_item("turn-A", "late-A".into(), None, "late".into()).await;
+    manager.handoff_out("turn-A", "late output".into(), None).await.unwrap();
+    manager.handle_terminal_handoff_event("turn-A", &completed_event("turn-A")).await.unwrap();
+    assert!(output.is_empty());
+    assert!(!state.stream.lock().await.items.contains_key("late-A"));
+
+    manager.activate_voice_turn("turn-B", Some(&b.origin_id)).await.unwrap();
+    buffer_without_timer(&manager, &state, "turn-B", "item-B").await;
+    manager.handoff_out("turn-B", "last B".into(), None).await.unwrap();
+    assert!(matches!(output.recv().await.unwrap(), RealtimeOutbound::HandoffUpdate { handoff_id, .. } if handoff_id == "B"));
+    manager.handle_terminal_handoff_event("turn-A", &aborted_event()).await.unwrap();
+    assert!(state.voice_routes.as_ref().unwrap().lock().await.binding("turn-B").is_some());
+    assert!(state.stream.lock().await.items.contains_key("item-B"));
+    assert!(state.last_output.lock().await.contains_key("turn-B"));
+    flush_streamed_handoff_item(&state, "turn-B", "item-B").await;
+    assert!(matches!(output.recv().await.unwrap(), RealtimeOutbound::HandoffAppend { handoff_id, text, .. }
+        if handoff_id == "B" && text == "buffered output"));
+    assert!(output.is_empty());
+    manager.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn strict_v2_abort_has_no_completion_but_complete_preserves_final_drain() {
+    for abort in [true, false] {
+        let (manager, state, output, scope) = manager(RealtimeEventParser::RealtimeV2).await;
+        let a = voice_admission_input(ThreadId::new(), &scope, &handoff("A"), "A".into()).unwrap();
+        manager.remember_voice_origin(&a).await.unwrap();
+        manager.activate_voice_turn("turn-A", Some(&a.origin_id)).await.unwrap();
+        let cancellation = state.voice_routes.as_ref().unwrap().lock().await
+            .output_route("turn-A").unwrap().1;
+        manager.handoff_out("turn-A", "last A".into(), None).await.unwrap();
+        assert!(matches!(output.recv().await.unwrap(), RealtimeOutbound::HandoffUpdate { .. }));
+        let terminal = if abort { aborted_event() } else { completed_event("turn-A") };
+        manager.handle_terminal_handoff_event("turn-A", &terminal).await.unwrap();
+        assert!(cancellation.is_cancelled());
+        assert!(state.voice_routes.as_ref().unwrap().lock().await.binding("turn-A").is_none());
+        assert!(!state.last_output.lock().await.contains_key("turn-A"));
+        if abort {
+            assert!(output.is_empty());
+            assert_eq!(state.v2_handoff_payload("A", V2HandoffStage::Final, "late final".into()).await, None);
+        } else {
+            assert_eq!(output.recv().await.unwrap(), RealtimeOutbound::CompletedHandoff {
+                handoff_id: "A".into(), text: realtime_backend_output("last A".into(), state.session_kind), phase: None,
+            });
+            assert_eq!(state.v2_handoff_payload("A", V2HandoffStage::Final, "last A".into()).await, Some("last A".into()));
+        }
+        manager.handle_terminal_handoff_event("turn-A", &terminal).await.unwrap();
+        assert!(output.is_empty());
+        manager.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn non_strict_aborted_event_preserves_upstream_handoff_state() {
+    let (manager, mut state, output, _) = manager(RealtimeEventParser::FramelessBidi).await;
+    state.voice_routes = None;
+    manager.state.lock().await.as_mut().unwrap().handoff.voice_routes = None;
+    assert_eq!(state.receive_handoff(&handoff("ordinary")).await, HandoffArrivalEffect::Activated);
+    buffer_without_timer(&manager, &state, "turn-A", "item-A").await;
+    manager.handoff_out("turn-A", "ordinary last".into(), None).await.unwrap();
+    assert!(matches!(output.recv().await.unwrap(), RealtimeOutbound::HandoffUpdate { .. }));
+    manager.handle_terminal_handoff_event("turn-A", &aborted_event()).await.unwrap();
+    assert!(output.is_empty());
+    assert_eq!(state.stream.lock().await.active_handoff.as_deref(), Some("ordinary"));
+    assert!(state.stream.lock().await.items.contains_key("item-A"));
+    assert_eq!(state.last_output.lock().await.get("turn-A").unwrap().text, "ordinary last");
+    flush_streamed_handoff_item(&state, "turn-A", "item-A").await;
+    assert!(matches!(output.recv().await.unwrap(), RealtimeOutbound::HandoffAppend { handoff_id, .. } if handoff_id == "ordinary"));
+    manager.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn abort_cancels_an_already_drained_flush_blocked_on_channel_capacity() {
+    use std::future::Future;
+    use std::task::Poll;
+
+    let (manager, state, output, scope) = manager(RealtimeEventParser::FramelessBidi).await;
+    let a = voice_admission_input(ThreadId::new(), &scope, &handoff("A"), "A".into()).unwrap();
+    manager.remember_voice_origin(&a).await.unwrap();
+    manager.activate_voice_turn("turn-A", Some(&a.origin_id)).await.unwrap();
+    buffer_without_timer(&manager, &state, "turn-A", "item-A").await;
+    for _ in 0..16 {
+        state.output_tx.try_send(RealtimeOutbound::StandaloneSpeech { text: "sentinel".into() }).unwrap();
+    }
+    let mut flush = Box::pin(flush_streamed_handoff_item(&state, "turn-A", "item-A"));
+    std::future::poll_fn(|cx| {
+        assert!(flush.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    }).await;
+    {
+        let stream = state.stream.lock().await;
+        let item = stream.items.get("item-A").unwrap();
+        assert!(item.buffered_text.is_empty());
+        assert!(item.sent_bytes > 0);
+    }
+    manager.handle_terminal_handoff_event("turn-A", &aborted_event()).await.unwrap();
+    // No channel capacity was released: only retirement can make this send ready.
+    std::future::poll_fn(|cx| {
+        assert!(flush.as_mut().poll(cx).is_ready());
+        Poll::Ready(())
+    }).await;
+    assert!(!state.stream.lock().await.items.contains_key("item-A"));
+    for _ in 0..16 {
+        assert_eq!(output.try_recv().unwrap(), RealtimeOutbound::StandaloneSpeech { text: "sentinel".into() });
+    }
+    assert!(output.is_empty());
     manager.shutdown().await.unwrap();
 }
