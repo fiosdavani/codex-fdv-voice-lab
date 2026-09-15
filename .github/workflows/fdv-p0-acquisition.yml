@@ -33,12 +33,12 @@ jobs:
           gh run download 34973146146 --repo fiosdavani/codex-fdv-voice-lab --name target-p0-evidence-34973146146-1 --dir previous-receipts
       - name: Focal static context after rehash of both bundles
         working-directory: fdv-p0
-        run: python3 -B focus_target.py
+        run: python3 -B composer_target.py
       - name: Preserve bounded evidence
         if: always()
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
         with:
-          name: target-p0-focus-${{ github.run_id }}-${{ github.run_attempt }}
+          name: target-p0-composer-${{ github.run_id }}-${{ github.run_attempt }}
           path: fdv-p0/receipts/
           if-no-files-found: error
           retention-days: 7
