@@ -1,0 +1,70 @@
+name: FDV P0 static Desktop acquisition
+
+on:
+  push:
+    branches: [fdv/p0-acquisition-20260915-01]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fdv-p0-acquisition-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  acquisition:
+    if: github.repository == 'fiosdavani/codex-fdv-voice-lab' && github.ref == 'refs/heads/fdv/p0-acquisition-20260915-01'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          sparse-checkout: fdv-p0
+      - name: Prepare bounded static workspace
+        working-directory: fdv-p0
+        run: |
+          test "$(id -u)" != 0
+          mkdir incoming work target receipts evidence
+          cp EXPECTED-SOURCES.json evidence/EXPECTED-SOURCES.json
+          echo '5fe136594ea8ce75bac7355c03955b3ff8db10eccfe4ad94de5d68e35f3f283f  extract_target.py' | sha256sum --check --strict
+          python3 --version
+          gh --version
+      - name: Download permanent pinned release asset
+        working-directory: fdv-p0
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download chatgpt-codex-windows-26.908.4834.0 --repo NNNaughtyDog/codex-desktop-mirror-plus --pattern 'OpenAI.Codex_26.908.4834.0_x64__2p2nqsd0c76g0.msix' --dir incoming
+      - name: Verify MSIX before any extraction
+        working-directory: fdv-p0
+        run: python3 -B verify_msix.py
+      - name: Run unchanged reviewed static extractor
+        id: extract
+        working-directory: fdv-p0
+        run: python3 -B extract_target.py --msix incoming/OpenAI.Codex_26.908.4834.0_x64__2p2nqsd0c76g0.msix
+      - name: Compare anchors and locate equivalents without executing JavaScript
+        working-directory: fdv-p0
+        run: python3 -B analyze_target.py
+      - name: Emit bounded P0 evidence
+        if: always()
+        working-directory: fdv-p0
+        run: python3 -B emit_receipt.py
+      - name: Preserve bounded evidence
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+        with:
+          name: target-p0-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: fdv-p0/receipts/
+          if-no-files-found: error
+          retention-days: 7
+      - name: Preserve only verified bundles temporarily
+        if: always() && steps.extract.outcome == 'success'
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+        with:
+          name: target-p0-bundles-${{ github.run_id }}-${{ github.run_attempt }}
+          path: fdv-p0/target/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 3

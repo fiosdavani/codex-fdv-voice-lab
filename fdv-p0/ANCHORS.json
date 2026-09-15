@@ -1,0 +1,112 @@
+[
+  {
+    "id": 1,
+    "label": "sns.start explicit boundary",
+    "old": "          outputAudioMuted: o = !1,\n"
+  },
+  {
+    "id": 2,
+    "label": "pre-autoplay sink fence",
+    "old": "            ((u.autoplay = !0), (u.hidden = !0), (u.muted = o));"
+  },
+  {
+    "id": 3,
+    "label": "capture sink scope",
+    "old": "              (l = new e(c, s, u, d, r)),"
+  },
+  {
+    "id": 4,
+    "label": "late track cannot revive retired sink",
+    "old": "                l != null &&\n                  ((l.outputStream"
+  },
+  {
+    "id": 5,
+    "label": "reassert mute before attaching each incoming stream",
+    "old": "                  ((l.outputStream = e.streams[0] ?? null),"
+  },
+  {
+    "id": 6,
+    "label": "reassert mute immediately before explicit play",
+    "old": "                  i(),\n                  u.play().catch(() => {}));"
+  },
+  {
+    "id": 7,
+    "label": "SET only; actual sink readback",
+    "old": "        setOutputAudioMuted(e) {\n          ((this.audioElement.muted = e),"
+  },
+  {
+    "id": 8,
+    "label": "runtime getter and forced SET",
+    "old": "        setOutputMuted(e) {\n          ((this.#i = e), this.#s?.setOutputAudioMuted(e));\n        }"
+  },
+  {
+    "id": 9,
+    "label": "pass boundary into sink constructor",
+    "old": "            outputAudioMuted: this.#i,\n"
+  },
+  {
+    "id": 10,
+    "label": "actual data channel tap",
+    "old": "          let n = dns.safeParse(t);"
+  },
+  {
+    "id": 11,
+    "label": "provider identity seal",
+    "old": "          let r = uns.safeParse(t);\n"
+  },
+  {
+    "id": 12,
+    "label": "strict unscoped notification cannot close successor",
+    "old": "          if (e.method !== `thread/realtime/sdp`) {"
+  },
+  {
+    "id": 13,
+    "label": "all strict stop paths forbid thread-only RPC",
+    "old": "        #_() {\n          if (!this.#e) return Promise.resolve();"
+  },
+  {
+    "id": 14,
+    "label": "dispose retires captured boundary",
+    "old": "        dispose(e = !1) {\n          if (this.#n) return;\n          ((this.#n = !0),"
+  },
+  {
+    "id": 15,
+    "label": "opt-in start binding parameter",
+    "old": "            initiallyMuted: c = !1,\n"
+  },
+  {
+    "id": 16,
+    "label": "binding before runtime construction",
+    "old": "          let x = [],\n            S = new fns({"
+  },
+  {
+    "id": 17,
+    "label": "initial mute before preparing runtime",
+    "old": "              initiallyOutputMuted: c,\n"
+  },
+  {
+    "id": 18,
+    "label": "claim state cannot undo preplay mute",
+    "old": "          let w = [],\n            T;\n          try {"
+  },
+  {
+    "id": 19,
+    "label": "strict owner stop routes scoped",
+    "old": "          let i = this.runtime,\n            a = this.startRequestId,\n            o = this.realtimeVoiceHostClaim.getClaimId();"
+  },
+  {
+    "id": 20,
+    "label": "owner scope readback and scoped close entry",
+    "old": "        refreshMicrophoneInput(e) {\n          return (\n            (this.microphonePreference = e),"
+  },
+  {
+    "id": 21,
+    "label": "UI intent reflects strict forced mute",
+    "old": "        applyRealtimeMuteState(e, t) {\n          (this.runtime?.setOutputMuted(t),"
+  },
+  {
+    "id": 22,
+    "label": "read actual composer after React commit",
+    "old": "    } = _o;\n  Krs(cn.view.dom, (e) => {"
+  }
+]

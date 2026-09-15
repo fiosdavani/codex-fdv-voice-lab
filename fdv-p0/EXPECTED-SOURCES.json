@@ -1,0 +1,13 @@
+{
+  "release_url": "https://github.com/NNNaughtyDog/codex-desktop-mirror-plus/releases/tag/chatgpt-codex-windows-26.908.4834.0",
+  "release_id": 387384147,
+  "release_updated": "2026-09-14T23:52:53Z",
+  "github_url": "https://github.com/NNNaughtyDog/codex-desktop-mirror-plus/releases/download/chatgpt-codex-windows-26.908.4834.0/OpenAI.Codex_26.908.4834.0_x64__2p2nqsd0c76g0.msix",
+  "sha1": "5678e4c10eefd675055cb5178990beafbcafcff8",
+  "sha256": "ae01e44b60f3c42fada0cf7deb220104bb8e9111ee79cda16bd57ce7e59c72b0",
+  "expected_bytes": 774918112,
+  "version": "26.908.4834.0",
+  "architecture": "x64",
+  "renderer_sha256": "7c3a89e7e224f76031b45a88f72af8cd60f0c3d47aac9ca34b2c70e11dfe9867",
+  "main_sha256": "b55be874a9b5a262c09a7945df38cec9b0ce8f14bd584ef73d6feca301ed90b4"
+}
